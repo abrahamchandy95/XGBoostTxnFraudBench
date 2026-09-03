@@ -1,0 +1,63 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY merchant_merchant_with_weights(
+    STRING build_id,
+    INT    min_edge_weight = 1,
+    INT    max_card_degree = 5000,
+    INT    min_interaction_txn_count = 1,
+    INT    num_of_source_batches = 1
+) FOR GRAPH TF_GNN {
+
+  SetAccum<VERTEX<Merchant>>                @merchants;
+  MapAccum<VERTEX<Merchant>, SumAccum<INT>> @edge_weight;
+
+  SumAccum<INT> @@inserted, @@suppressed_below_min_weight, @@hub_cards_skipped;
+
+  hubs = SELECT c FROM Card:c
+         WHERE c.seen == TRUE
+           AND c.outdegree("Has_Interaction_With_Merchant") > max_card_degree
+         POST-ACCUM @@hub_cards_skipped += 1;
+
+  cards = SELECT c
+      FROM Card:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+      WHERE e.build_id == build_id
+        AND e.txn_count >= min_interaction_txn_count
+        AND c.outdegree("Has_Interaction_With_Merchant") <= max_card_degree
+      ACCUM c.@merchants += m;
+
+  FOREACH i IN RANGE[0, num_of_source_batches-1] DO
+
+      merchant_batch = SELECT m
+          FROM Merchant:m -(Has_Interaction_With_Merchant:e)- Card:c
+          WHERE getvid(m) % num_of_source_batches == i
+            AND e.build_id == build_id
+            AND e.txn_count >= min_interaction_txn_count
+            AND c.outdegree("Has_Interaction_With_Merchant") <= max_card_degree
+          ACCUM
+            FOREACH merc IN c.@merchants DO
+              IF getvid(m) < getvid(merc) THEN
+                m.@edge_weight += (merc -> 1)
+              END
+            END;
+
+      ins = SELECT m FROM merchant_batch:m
+          POST-ACCUM
+            FOREACH (merc, w) IN m.@edge_weight DO
+              IF w >= min_edge_weight THEN
+                INSERT INTO Merchant_Merchant VALUES (m, merc, w),
+                @@inserted += 1
+              ELSE
+                @@suppressed_below_min_weight += 1
+              END
+            END,
+            m.@edge_weight.clear();
+  END;
+
+  PRINT @@inserted                    AS merchant_merchant_edges_inserted,
+        @@suppressed_below_min_weight AS pairs_below_min_edge_weight,
+        @@hub_cards_skipped           AS hub_cards_skipped,
+        min_edge_weight               AS min_edge_weight_used,
+        max_card_degree               AS max_card_degree_used,
+        min_interaction_txn_count     AS min_interaction_txn_count_used,
+        build_id                      AS build_id;
+}

@@ -1,0 +1,106 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY assert_resolved_entity(
+    UINT  cutoff_event_seq,
+    INT   max_member_count = 50,
+    FLOAT max_component_fraction = 0.05,
+    INT   top_k = 20
+) FOR GRAPH TF_GNN {
+
+  TYPEDEF TUPLE<INT reid, INT members> EntitySize;
+
+  SumAccum<INT>    @giant_members;
+  MaxAccum<STRING> @rel;
+
+  MapAccum<INT, SumAccum<INT>> @@members_by_reid;
+  MapAccum<INT, SumAccum<INT>> @@size_histogram;
+  HeapAccum<EntitySize>(top_k, members DESC) @@largest_entities;
+
+  MapAccum<STRING, MaxAccum<INT>> @@worst_hub_per_relation;
+  MapAccum<STRING, SumAccum<INT>> @@pii_values_per_relation;
+
+  SumAccum<INT> @@parties_resolved, @@parties_unresolved;
+  SumAccum<INT> @@entities, @@singletons;
+
+  SetAccum<STRING> @@edge_type_set;
+
+  @@edge_type_set = (
+    "Party_Has_Birthdate",
+    "Party_Has_Street_Address",
+    "Party_Has_Identity_Document",
+    "Party_Has_Email_Address_Hash",
+    "Party_Has_Name_Hash",
+    "Party_Has_Phone_Hash"
+  );
+
+  scoped = SELECT p FROM Party:p
+           WHERE p.first_seen_event_seq > 0
+             AND p.first_seen_event_seq < cutoff_event_seq
+           POST-ACCUM
+             IF p.re_id == -1 THEN
+                 @@parties_unresolved += 1
+             ELSE
+                 @@parties_resolved += 1,
+                 @@members_by_reid += (p.re_id -> 1)
+             END;
+
+  INT giant_reid = -1;
+  INT giant_size = 0;
+  FOREACH (rid, sz) IN @@members_by_reid DO
+      @@entities += 1;
+      @@size_histogram += (sz -> 1);
+      @@largest_entities += EntitySize(rid, sz);
+      IF sz == 1 THEN @@singletons += 1; END;
+      IF sz > giant_size THEN
+          giant_size = sz;
+          giant_reid = rid;
+      END;
+  END;
+
+  /* ---- what chained the largest entity together ---- */
+  giant = SELECT p FROM Party:p
+          WHERE p.re_id == giant_reid
+            AND p.first_seen_event_seq > 0
+            AND p.first_seen_event_seq < cutoff_event_seq;
+
+  hubs = SELECT v
+         FROM giant:p -(@@edge_type_set:e)- :v
+         WHERE e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+         ACCUM v.@giant_members += 1, v.@rel += e.type;
+
+  agg = SELECT v FROM hubs:v
+        POST-ACCUM
+          @@worst_hub_per_relation  += (v.@rel -> v.@giant_members),
+          @@pii_values_per_relation += (v.@rel -> 1);
+
+  DOUBLE fraction = 0;
+  IF @@parties_resolved > 0 THEN
+      fraction = (1.0 * giant_size) / @@parties_resolved;
+  END;
+
+  BOOL fail_absolute = (giant_size > max_member_count);
+  BOOL fail_fraction = (fraction > max_component_fraction);
+
+  PRINT fail_absolute AS ABORT_largest_entity_over_max_member_count,
+        fail_fraction AS ABORT_largest_entity_over_max_fraction,
+        giant_size    AS largest_entity_member_count,
+        giant_reid    AS largest_entity_reid,
+        fraction      AS largest_entity_fraction,
+        max_member_count AS max_member_count_used,
+        max_component_fraction AS max_component_fraction_used;
+
+  PRINT @@parties_resolved   AS parties_resolved,
+        @@parties_unresolved AS parties_with_no_re_id,
+        @@entities           AS resolved_entity_count,
+        @@singletons         AS singleton_entities,
+        cutoff_event_seq     AS cutoff_used;
+
+  /* READ THIS BEFORE CHANGING ANY PARAMETER. See the header: a big
+     number on Party_Has_Identity_Document can be synthetic identity,
+     where the merge is correct rather than a bug. */
+  PRINT @@worst_hub_per_relation  AS worst_hub_per_relation_in_largest_entity,
+        @@pii_values_per_relation AS distinct_pii_values_per_relation_in_largest_entity;
+
+  PRINT @@size_histogram    AS entity_size_histogram,
+        @@largest_entities  AS largest_entities;
+}

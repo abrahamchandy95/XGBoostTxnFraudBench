@@ -1,0 +1,275 @@
+/*
+======================================================================
+card_row_temporal — STAGE 3. PER-ROW temporal features, computed in GSQL.
+======================================================================
+Six backward-looking features per TRANSACTION, from one card-anchored
+gather -> sort -> single forward scan.
+
+======================================================================
+NO build_id. NO cutoff_event_seq. THAT IS THE WHOLE DESIGN.
+======================================================================
+Every value below is a function of that card's events STRICTLY EARLIER
+than the row itself. The reference time is always the ROW'S OWN
+unix_time, exclusive of the row. Such a feature is causal BY
+CONSTRUCTION and is therefore valid for every build simultaneously --
+so this query runs ONCE, like target_edges, not once per build.
+
+That is not a shortcut, it is the leak-safe choice, and the alternative
+is actively wrong. A temporal feature anchored at the BUILD CUTOFF
+("transactions in the 7 days before this snapshot") has its magnitude
+bounded by (cutoff time - data start), so the column ENCODES WHICH
+SNAPSHOT SERVED THE ROW. It also inherits the fold geometry: each
+training fold serves a ~4.9M-rank window while b_val and b_test serve
+~1.3M each, so the scored splits would get temporal features several
+times fresher than the fitted ones. A row-anchored window has no cutoff
+in it at all, and both problems vanish.
+
+It is also the right SHAPE. systemprompt records that
+Card.max_travel_velocity_kmh and Card.impossible_travel_count were
+DELETED for exactly this reason: "Both were CARD-level aggregates while
+the label is per-transaction." The shipped replacement
+(pair_home_distance_km) is row-level. A per-entity temporal scalar
+stamped onto every one of a card's transactions repeats a mistake this
+repo already diagnosed and paid for.
+
+======================================================================
+WHAT IS EMITTED, AND WHICH SENTINEL EACH ONE USES
+======================================================================
+  row_card_gap_seconds      this row's unix_time minus the card's
+                            previous transaction. -1 on a card's FIRST
+                            transaction: there is no previous one, so
+                            the gap does not exist.
+  row_pair_gap_seconds      same, but the card's previous transaction
+                            AT THIS MERCHANT. -1 on first visit. This
+                            is what answers Story 5b's "per merchant"
+                            without a merchant-anchored pass -- see the
+                            refusal below.
+  row_card_txn_count_1h     prior transactions in [t-3600, t)
+  row_card_txn_count_24h    prior transactions in [t-86400, t)
+  row_card_amount_24h       sum of their amounts
+  row_card_tenure_seconds   this row's unix_time minus the card's
+                            EARLIEST transaction
+
+THE SENTINEL SPLIT IS DELIBERATE AND FOLLOWS wcc_bipartite's cc_degree
+REASONING. The two gaps use -1 because on a first transaction they are
+UNDEFINED. The counts, the amount and the tenure are 0 on a first
+transaction and 0 is the TRUE, KNOWABLE answer -- zero prior
+transactions, zero prior spend, zero elapsed tenure. Coding those as -1
+would throw away a real observation and make "no history" indistinguish-
+able from "not computed". Only register the two gaps in
+SENTINEL_AT_MINUS_ONE.
+
+======================================================================
+MERCHANT-ANCHORED PER-ROW FEATURES ARE REFUSED, NOT DEFERRED
+======================================================================
+The gather-sort idiom materialises one vertex's entire history in a
+vertex-attached accumulator, and batching by getvid residue CANNOT
+split a single hot vertex. On the regenerated load one merchant reaches
+51% of all cards. A merchant-anchored gather would therefore put a
+double-digit-percent share of the corpus into one accumulator, which is
+the exact shape that produced the System Memory abort on 2026-08-02.
+row_pair_gap_seconds is per-(card, merchant) and comes free off the
+card-side gather, which is the useful part of "per merchant" anyway.
+
+======================================================================
+ONE HOP, NOT TWO
+======================================================================
+Payment_Transaction carries FLAT join keys -- card_number and
+merchant_id (schema.gsql:423-424) -- so the merchant is read off the
+transaction record and Transaction_To_Merchant is never traversed. Half
+the expansion of card_interval_max, which walks the second hop only to
+learn the same merchant id.
+
+Cost: one 1-hop expansion over the transaction edges plus an O(n log n)
+sort per card, ONCE for the whole run rather than once per build.
+
+======================================================================
+num_of_source_batches IS SIZED BY ROWS, NOT BY CARDS
+======================================================================
+Every batch returns one output row per transaction it covers, and the
+whole query returns one row per transaction in the corpus. The binding
+constraint is therefore SERIALISATION, not graph work: match the fact
+exporter's page size (tigergraph_export.fact_page_rows) rather than the
+card-partition counts used by the build queries. Batching by getvid
+residue does not balance rows exactly -- cards differ in activity -- so
+leave headroom.
+
+heap_capacity must exceed the BUSIEST card's transaction count. The
+failure direction is benign: HeapAccum(cap, ut ASC) keeps the smallest
+on overflow, so truncation DROPS trailing rows, which the row-count
+reconciliation catches loudly rather than silently understating a
+value. cards_truncated_MUST_BE_ZERO gates it anyway.
+======================================================================
+*/
+
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY card_row_temporal(
+    INT source_batch = 0,
+    INT num_of_source_batches = 1,
+    INT heap_capacity = 5000
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  TYPEDEF TUPLE<UINT ut, UINT eseq, DOUBLE amt, STRING tid, STRING mid> TxnPoint;
+
+  TYPEDEF TUPLE<STRING id, UINT event_seq,
+                DOUBLE row_card_gap_seconds,
+                DOUBLE row_pair_gap_seconds,
+                INT    row_card_txn_count_1h,
+                INT    row_card_txn_count_24h,
+                DOUBLE row_card_amount_24h,
+                DOUBLE row_card_tenure_seconds,
+                DOUBLE row_card_gap_ratio,
+                DOUBLE row_amount_z,
+                INT    row_pair_txn_count> TemporalRow;
+
+  HeapAccum<TxnPoint>(heap_capacity, ut ASC) @heap;
+  ListAccum<TxnPoint>                        @sorted;
+
+  /* Last time this card was seen at each merchant, updated AS the scan
+     advances so it only ever holds strictly-earlier rows. MaxAccum<UINT>
+     defaults to 0 and a real unix_time is never 0, so get() == 0 means
+     "not seen yet" -- no containsKey needed. */
+  MapAccum<STRING, MaxAccum<UINT>> @last_seen;
+  /* Prior visits to each merchant, incremented AFTER the emit like @last_seen.
+     Gives row_pair_txn_count: depth of the relationship, where
+     row_pair_gap_seconds gives its recency. */
+  MapAccum<STRING, SumAccum<INT>>  @pair_count;
+  SumAccum<INT>                    @txn_total;
+
+  ListAccum<TemporalRow> @@rows;
+  SumAccum<INT> @@rows_emitted, @@cards_truncated, @@cards_with_history;
+
+  INT W1  = 3600;
+  INT W24 = 86400;
+
+  card_batch = SELECT c FROM Card:c
+               WHERE getvid(c) % num_of_source_batches == source_batch;
+
+  /* event_seq > 0 excludes the unknown sentinel. NO cutoff: the window
+     is bounded by the row, not by a build. */
+  gather = SELECT c
+      FROM card_batch:c -(Card_Send_Transaction>:e1)- Payment_Transaction:t
+      WHERE t.event_seq > 0
+      ACCUM c.@heap += TxnPoint(t.unix_time, t.event_seq, t.amount,
+                                t.id, t.merchant_id),
+            c.@txn_total += 1;
+
+  scan = SELECT c FROM card_batch:c
+      POST-ACCUM
+        IF c.@txn_total > heap_capacity THEN @@cards_truncated += 1 END,
+
+        /* ut ASC, so popping yields ascending time. */
+        WHILE c.@heap.size() > 0 DO
+            c.@sorted += c.@heap.pop()
+        END,
+
+        INT n = c.@sorted.size(),
+        INT lo1 = 0,
+        INT lo24 = 0,
+        DOUBLE amt24 = 0,
+        DOUBLE gap = -1,
+        DOUBLE pgap = -1,
+        UINT seen_at = 0,
+        /* Running moments over PRIOR rows only, advanced after each emit.
+           gap_sum/gap_n give the mean prior gap; amt_sum/amt_sq give the mean
+           and variance of prior amounts. All three new features are functions
+           of these, so they cost no extra traversal. */
+        DOUBLE gap_sum = 0,
+        DOUBLE gap_n = 0,
+        DOUBLE amt_sum = 0,
+        DOUBLE amt_sq = 0,
+        DOUBLE ratio = -1,
+        DOUBLE zscore = -1,
+        DOUBLE mean_amt = 0,
+        DOUBLE var_amt = 0,
+
+        IF n > 0 THEN
+            @@cards_with_history += 1,
+
+            FOREACH hi IN RANGE[0, n-1] DO
+                /* Both windows cover PRIOR rows only -- indices
+                   [lo, hi-1]. lo stops at hi, which is an empty window,
+                   so it never passes hi and never indexes past the end.
+                   Exclude when (t - ut) > W, i.e. keep ut >= t - W. */
+                WHILE lo24 < hi AND
+                      (c.@sorted.get(hi).ut - c.@sorted.get(lo24).ut) > W24 DO
+                    amt24 = amt24 - c.@sorted.get(lo24).amt,
+                    lo24 = lo24 + 1
+                END,
+                WHILE lo1 < hi AND
+                      (c.@sorted.get(hi).ut - c.@sorted.get(lo1).ut) > W1 DO
+                    lo1 = lo1 + 1
+                END,
+
+                gap = -1,
+                IF hi > 0 THEN
+                    gap = c.@sorted.get(hi).ut - c.@sorted.get(hi-1).ut
+                END,
+
+                seen_at = c.@last_seen.get(c.@sorted.get(hi).mid),
+                pgap = -1,
+                IF seen_at > 0 THEN
+                    pgap = c.@sorted.get(hi).ut - seen_at
+                END,
+
+                /* NORMALISED velocity. A card that transacts hourly and one
+                   that transacts monthly are not comparable on raw gap; they
+                   are on gap over its own mean. -1 until a mean exists, which
+                   needs two prior rows. */
+                ratio = -1,
+                IF gap_n > 0 AND gap > 0 THEN
+                    ratio = gap / (gap_sum / gap_n)
+                END,
+
+                /* "Unusually large FOR THIS CARD". amount is absolute today,
+                   which cannot express that. Population variance over priors;
+                   needs two priors for a non-zero denominator. */
+                zscore = -1,
+                IF gap_n > 1 THEN
+                    mean_amt = amt_sum / (gap_n + 1),
+                    var_amt = amt_sq / (gap_n + 1) - mean_amt * mean_amt,
+                    IF var_amt > 0 THEN
+                        zscore = (c.@sorted.get(hi).amt - mean_amt)
+                                 / sqrt(var_amt)
+                    END
+                END,
+
+                @@rows += TemporalRow(
+                    c.@sorted.get(hi).tid,
+                    c.@sorted.get(hi).eseq,
+                    gap,
+                    pgap,
+                    hi - lo1,
+                    hi - lo24,
+                    amt24,
+                    c.@sorted.get(hi).ut - c.@sorted.get(0).ut,
+                    ratio,
+                    zscore,
+                    c.@pair_count.get(c.@sorted.get(hi).mid)
+                ),
+                @@rows_emitted += 1,
+
+                /* THIS row becomes a prior for the next one. Both updates
+                   happen AFTER the emit, which is what keeps the window
+                   strictly earlier than the row it describes. */
+                c.@last_seen += (c.@sorted.get(hi).mid -> c.@sorted.get(hi).ut),
+                c.@pair_count += (c.@sorted.get(hi).mid -> 1),
+                amt24 = amt24 + c.@sorted.get(hi).amt,
+                IF gap > 0 THEN gap_sum = gap_sum + gap, gap_n = gap_n + 1 END,
+                amt_sum = amt_sum + c.@sorted.get(hi).amt,
+                amt_sq = amt_sq + c.@sorted.get(hi).amt * c.@sorted.get(hi).amt
+            END
+        END,
+
+        c.@heap.clear(), c.@sorted.clear(),
+        c.@last_seen.clear(), c.@pair_count.clear();
+
+  PRINT @@rows AS temporal_rows;
+
+  PRINT @@rows_emitted       AS rows_returned,
+        @@cards_with_history AS cards_with_history,
+        @@cards_truncated    AS cards_truncated_MUST_BE_ZERO,
+        source_batch         AS source_batch,
+        num_of_source_batches AS source_batch_count;
+}

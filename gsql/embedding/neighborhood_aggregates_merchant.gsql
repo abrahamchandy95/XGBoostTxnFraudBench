@@ -1,0 +1,57 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY neighborhood_aggregates_merchant(
+    STRING build_id,
+    INT    min_weight = 0
+) FOR GRAPH TF_GNN {
+
+  SumAccum<DOUBLE> @pr_sum, @cs_sum, @tc_sum;
+  SumAccum<INT>    @pr_n, @cs_n, @tc_n;
+  MaxAccum<DOUBLE> @pr_max, @cs_max, @tc_max;
+
+  SumAccum<INT> @@written, @@no_valid_neighbor, @@merchants_unseen;
+
+  Seen = SELECT m FROM Merchant:m WHERE m.seen == TRUE;
+
+  agg = SELECT s FROM Seen:s -(Merchant_Merchant:e)- Seen:t
+        WHERE e.weight >= min_weight
+        ACCUM
+          IF t.pagerank != -1 THEN
+              s.@pr_sum += t.pagerank, s.@pr_n += 1, s.@pr_max += t.pagerank
+          END,
+          IF t.c_size != -1 THEN
+              s.@cs_sum += t.c_size, s.@cs_n += 1, s.@cs_max += t.c_size
+          END,
+          IF t.txn_count != -1 THEN
+              s.@tc_sum += t.txn_count, s.@tc_n += 1, s.@tc_max += t.txn_count
+          END;
+
+  wr = SELECT s FROM Seen:s
+      POST-ACCUM
+        IF s.@pr_n > 0 THEN
+            s.nbr_pagerank_mean = s.@pr_sum / s.@pr_n,
+            s.nbr_pagerank_max = s.@pr_max
+        END,
+        IF s.@cs_n > 0 THEN
+            s.nbr_c_size_mean = s.@cs_sum / s.@cs_n,
+            s.nbr_c_size_max = s.@cs_max
+        END,
+        IF s.@tc_n > 0 THEN
+            s.nbr_txn_count_mean = s.@tc_sum / s.@tc_n,
+            s.nbr_txn_count_max = s.@tc_max
+        END,
+        IF s.@pr_n > 0 OR s.@cs_n > 0 OR s.@tc_n > 0 THEN
+            @@written += 1
+        ELSE
+            @@no_valid_neighbor += 1
+        END;
+
+  unseen = SELECT m FROM Merchant:m WHERE m.seen == FALSE
+           POST-ACCUM @@merchants_unseen += 1;
+
+  PRINT @@written            AS merchants_with_neighborhood_features,
+        @@no_valid_neighbor AS merchants_with_no_valid_neighbor,
+        @@merchants_unseen       AS merchants_unseen_excluded,
+        min_weight           AS min_weight_used,
+        build_id             AS build_id;
+}

@@ -1,0 +1,40 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY merchant_transaction_stats(
+    STRING build_id,
+    UINT   cutoff_event_seq
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT>    @cnt;
+  SumAccum<DOUBLE> @sum;
+  MaxAccum<DOUBLE> @max;
+  MinAccum<DOUBLE> @min;
+  SumAccum<INT>    @@with_history, @@without_history;
+
+  agg = SELECT m
+        FROM Merchant:m -(Merchant_Received_Transaction>:e)- Payment_Transaction:t
+        WHERE e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+        ACCUM m.@cnt += 1,
+              m.@sum += t.amount,
+              m.@max += t.amount,
+              m.@min += t.amount;
+
+  w = SELECT m FROM Merchant:m
+      POST-ACCUM
+        m.build_id = build_id,
+        IF m.@cnt > 0 THEN
+            m.txn_count      = m.@cnt,
+            m.total_amount   = m.@sum,
+            m.max_txn_amount = m.@max,
+            m.min_txn_amount = m.@min,
+            m.avg_txn_amount = m.@sum / m.@cnt,
+            @@with_history += 1
+        ELSE
+            @@without_history += 1
+        END;
+
+  PRINT @@with_history    AS merchants_with_history,
+        @@without_history AS merchants_left_at_sentinel,
+        cutoff_event_seq  AS cutoff_used,
+        build_id          AS build_id;
+}

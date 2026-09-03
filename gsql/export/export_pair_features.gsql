@@ -1,0 +1,27 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_pair_features(STRING build_id) FOR GRAPH TF_GNN {
+
+  TYPEDEF TUPLE<STRING card_number, STRING merchant_id,
+                DOUBLE home_distance_km> PairRow;
+
+  ListAccum<PairRow> @@pair_rows;
+  SumAccum<INT>      @@rows;
+  SumAccum<INT>      @@pairs_missing_geography;
+
+  pairs = SELECT c
+      FROM Card:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+      WHERE e.build_id == build_id
+      ACCUM
+        @@pair_rows += PairRow(c.card_number, m.id, e.home_distance_km),
+        @@rows += 1,
+        CASE WHEN e.home_distance_km < 0 THEN
+          @@pairs_missing_geography += 1
+        END;
+
+  PRINT @@pair_rows AS pair_features;
+
+  PRINT @@rows                    AS rows_returned,
+        @@pairs_missing_geography AS pairs_missing_geography,
+        build_id                  AS build_id;
+}

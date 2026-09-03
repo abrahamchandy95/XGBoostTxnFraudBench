@@ -1,0 +1,69 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY card_merchant_degree_stats(
+    STRING build_id
+) FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @deg, @repeat_deg;
+  SumAccum<INT> @loc_deg, @geo_loc_deg;
+  SumAccum<INT> @@cards_seen, @@merchants_seen, @@cards_unseen, @@merchants_unseen;
+  SumAccum<INT> @@merchants_multi_location;
+  MaxAccum<INT> @@max_locations_per_merchant;
+
+  SumAccum<INT> @@merchants_multi_geocoded_location;
+
+  x = SELECT c
+      FROM Card:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+      WHERE e.build_id == build_id
+      ACCUM c.@deg += 1, m.@deg += 1,
+            IF e.txn_count >= 2 THEN c.@repeat_deg += 1, m.@repeat_deg += 1 END;
+
+  // merchant footprint
+  loc = SELECT m
+        FROM Merchant:m -(Merchant_Has_Location:e)- Merchant_Location:l
+        ACCUM m.@loc_deg += 1,
+              IF l.has_coordinates == TRUE THEN m.@geo_loc_deg += 1 END;
+
+  wc = SELECT c FROM Card:c
+       POST-ACCUM
+         c.build_id = build_id,
+         IF c.@deg > 0 THEN
+            c.seen = TRUE,
+            c.distinct_merchant_count = c.@deg,
+            c.repeated_merchant_count = c.@repeat_deg,
+            @@cards_seen += 1
+         ELSE
+            c.seen = FALSE, @@cards_unseen += 1
+         END;
+
+  wm = SELECT m FROM Merchant:m
+       POST-ACCUM
+         m.build_id = build_id,
+         IF m.@deg > 0 THEN
+            m.seen = TRUE,
+            m.distinct_card_count = m.@deg,
+            m.repeated_card_count = m.@repeat_deg,
+            @@merchants_seen += 1
+         ELSE
+            m.seen = FALSE, @@merchants_unseen += 1
+         END,
+
+         IF m.@loc_deg > 0 THEN
+            @@max_locations_per_merchant += m.@loc_deg,
+            IF m.@loc_deg > 1 THEN @@merchants_multi_location += 1 END
+         END,
+         IF m.@geo_loc_deg > 1 THEN
+            @@merchants_multi_geocoded_location += 1
+         END;
+
+  PRINT @@cards_seen       AS cards_seen,
+        @@cards_unseen     AS cards_unseen,
+        @@merchants_seen   AS merchants_seen,
+        @@merchants_unseen AS merchants_unseen,
+        build_id           AS build_id;
+
+  PRINT @@max_locations_per_merchant AS max_locations_per_merchant,
+        @@merchants_multi_location   AS merchants_with_multiple_locations,
+        @@merchants_multi_geocoded_location
+            AS merchants_with_multiple_geocoded_locations_MUST_BE_ZERO;
+}

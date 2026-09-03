@@ -1,0 +1,47 @@
+// RUN after lifecycle/reset_build.gsql
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY reset_identity(
+    BOOL dry_run = FALSE
+) FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @@same_as_edges, @@resolved_entities;
+  SumAccum<INT> @@parties_cleared, @@cards_cleared, @@merchants_cleared;
+
+  sa = SELECT p
+       FROM Party:p -(Same_As:e)- Party:q
+       WHERE getvid(p) < getvid(q)
+       ACCUM
+         @@same_as_edges += 1,
+         IF NOT dry_run THEN DELETE(e) END;
+
+  re = SELECT r FROM Resolved_Entity:r
+       POST-ACCUM
+         @@resolved_entities += 1,
+         IF NOT dry_run THEN DELETE(r) END;
+
+  pt = SELECT p FROM Party:p
+       WHERE p.re_id != -1
+       POST-ACCUM
+         @@parties_cleared += 1,
+         IF NOT dry_run THEN p.re_id = -1 END;
+
+  cd = SELECT c FROM Card:c
+       WHERE c.re_id != -1
+       POST-ACCUM
+         @@cards_cleared += 1,
+         IF NOT dry_run THEN c.re_id = -1 END;
+
+  mc = SELECT m FROM Merchant:m
+       WHERE m.re_id != -1
+       POST-ACCUM
+         @@merchants_cleared += 1,
+         IF NOT dry_run THEN m.re_id = -1 END;
+
+  PRINT dry_run              AS dry_run,
+        @@same_as_edges      AS same_as_edges,
+        @@resolved_entities  AS resolved_entity_vertices,
+        @@parties_cleared    AS parties_with_stale_re_id,
+        @@cards_cleared      AS cards_with_stale_re_id,
+        @@merchants_cleared  AS merchants_with_stale_re_id;
+}

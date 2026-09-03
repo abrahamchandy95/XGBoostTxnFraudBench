@@ -1,0 +1,23 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_resolved_entity_features(STRING build_id)
+  FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @@rows;
+
+  Entities = SELECT r FROM Resolved_Entity:r
+             WHERE r.build_id == build_id AND r.member_count > 0
+             POST-ACCUM @@rows += 1;
+
+  PRINT Entities[
+      Entities.reid,
+      Entities.build_id,
+      Entities.member_count,
+      Entities.distinct_pii_count,
+      Entities.connected_card_count,
+      Entities.connected_merchant_count,
+      Entities.max_pair_score
+  ] AS resolved_entity_features;
+
+  PRINT @@rows AS rows_returned, build_id AS build_id;
+}

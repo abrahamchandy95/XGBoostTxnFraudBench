@@ -1,0 +1,92 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY card_interval_max(
+    STRING build_id,
+    UINT   cutoff_event_seq,
+    INT    interval_minutes = 5,
+    INT    heap_capacity = 5000,
+    INT    num_of_source_batches = 20
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  TYPEDEF TUPLE<UINT ut, DOUBLE amt> TxnPoint;
+
+  MapAccum<VERTEX<Merchant>, ListAccum<TxnPoint>> @by_merchant;
+  MapAccum<VERTEX<Merchant>, SumAccum<INT>>       @pair_count;
+
+  HeapAccum<TxnPoint>(heap_capacity, ut ASC) @heap;
+  ListAccum<TxnPoint>                        @sorted;
+
+  MaxAccum<DOUBLE> @best_amount;
+  MaxAccum<INT>    @best_count;
+
+  SumAccum<INT> @@with_history, @@without_history, @@pairs_truncated;
+  SumAccum<INT> @@txns_scanned;
+
+  INT window_seconds = interval_minutes * 60;
+
+  FOREACH b IN RANGE[0, num_of_source_batches-1] DO
+
+      card_batch = SELECT c FROM Card:c
+              WHERE getvid(c) % num_of_source_batches == b;
+
+      gather = SELECT c
+          FROM card_batch:c -(Card_Send_Transaction>:e1)- Payment_Transaction:t
+                       -(Transaction_To_Merchant>:e2)- Merchant:m
+          WHERE t.event_seq > 0 AND t.event_seq < cutoff_event_seq
+          ACCUM c.@by_merchant += (m -> TxnPoint(t.unix_time, t.amount)),
+                c.@pair_count  += (m -> 1),
+                @@txns_scanned += 1;
+
+      scan = SELECT c FROM card_batch:c
+          POST-ACCUM
+            FOREACH (m, pts) IN c.@by_merchant DO
+                IF c.@pair_count.get(m) > heap_capacity THEN
+                    @@pairs_truncated += 1
+                END,
+
+                c.@heap.clear(),
+                c.@sorted.clear(),
+                FOREACH p IN pts DO
+                    c.@heap += p
+                END,
+                WHILE c.@heap.size() > 0 DO
+                    c.@sorted += c.@heap.pop()
+                END,
+
+                INT n = c.@sorted.size(),
+                INT lo = 0,
+                DOUBLE running = 0,
+                FOREACH hi IN RANGE[0, n-1] DO
+                    running = running + c.@sorted.get(hi).amt,
+                    WHILE lo < hi AND
+                          (c.@sorted.get(hi).ut - c.@sorted.get(lo).ut) > window_seconds DO
+                        running = running - c.@sorted.get(lo).amt,
+                        lo = lo + 1
+                    END,
+                    c.@best_amount += running,
+                    c.@best_count  += (hi - lo + 1)
+                END
+            END,
+
+            c.build_id = build_id,
+            IF c.@by_merchant.size() > 0 THEN
+                c.max_amount_in_interval    = c.@best_amount,
+                c.max_txn_count_in_interval = c.@best_count,
+                @@with_history += 1
+            ELSE
+                @@without_history += 1
+            END,
+            c.@by_merchant.clear(),
+            c.@pair_count.clear();
+  END;
+
+  PRINT @@pairs_truncated  AS pairs_truncated_MUST_BE_ZERO,
+        @@with_history     AS cards_with_history,
+        @@without_history  AS cards_left_at_sentinel,
+        @@txns_scanned     AS transactions_under_cutoff,
+        interval_minutes   AS interval_minutes_used,
+        heap_capacity      AS heap_capacity_used,
+        num_of_source_batches AS batches_used,
+        cutoff_event_seq   AS cutoff_used,
+        build_id           AS build_id;
+}

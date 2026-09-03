@@ -1,0 +1,17 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY resident_build_id() FOR GRAPH TF_GNN SYNTAX V2 {
+
+  MaxAccum<STRING> @@seen_build;
+  SetAccum<STRING> @@distinct_builds;
+  SumAccum<INT>    @@edges;
+
+  probe = SELECT c FROM Card:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+          ACCUM @@seen_build      += e.build_id,
+                @@distinct_builds += e.build_id,
+                @@edges           += 1;
+
+  PRINT @@seen_build      AS resident_build_id,
+        @@distinct_builds AS distinct_build_ids,
+        @@edges           AS resident_edge_count;
+}

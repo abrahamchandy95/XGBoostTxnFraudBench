@@ -1,0 +1,59 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY build_interaction_edges(
+    STRING build_id,
+    UINT   cutoff_event_seq,
+    INT    source_batch = 0,
+    INT    num_of_source_batches = 1
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  MapAccum<VERTEX<Merchant>, SumAccum<INT>>    @cnt;
+  MapAccum<VERTEX<Merchant>, SumAccum<DOUBLE>> @amt;
+  MapAccum<VERTEX<Merchant>, MinAccum<INT>>    @first_seq;
+  MapAccum<VERTEX<Merchant>, MaxAccum<INT>>    @last_seq;
+  MapAccum<VERTEX<Merchant>, MinAccum<INT>>    @first_ut;
+  MapAccum<VERTEX<Merchant>, MaxAccum<INT>>    @last_ut;
+
+  SumAccum<INT> @@edges_inserted;
+  SumAccum<INT> @@txns_contributing;
+
+  card_batch = SELECT c FROM Card:c
+          WHERE getvid(c) % num_of_source_batches == source_batch;
+
+  pairs = SELECT c
+          FROM card_batch:c -(Card_Send_Transaction>:e1)- Payment_Transaction:t
+                       -(Transaction_To_Merchant>:e2)- Merchant:m
+          WHERE e1.edge_event_seq > 0 AND e1.edge_event_seq < cutoff_event_seq
+          ACCUM c.@cnt       += (m -> 1),
+                c.@amt       += (m -> t.amount),
+                c.@first_seq += (m -> t.event_seq),
+                c.@last_seq  += (m -> t.event_seq),
+                c.@first_ut  += (m -> t.unix_time),
+                c.@last_ut   += (m -> t.unix_time),
+                @@txns_contributing += 1;
+
+  ins = SELECT c FROM card_batch:c
+        POST-ACCUM
+          FOREACH (m, k) IN c.@cnt DO
+            INSERT INTO Has_Interaction_With_Merchant
+              (FROM, TO, txn_count, total_amount,
+               first_unix_time, first_event_seq,
+               last_unix_time,  last_event_seq,
+               build_id)
+              VALUES (c, m, k, c.@amt.get(m),
+                      c.@first_ut.get(m), c.@first_seq.get(m),
+                      c.@last_ut.get(m),  c.@last_seq.get(m),
+                      build_id),
+            @@edges_inserted += 1
+          END,
+          c.@cnt.clear(), c.@amt.clear(),
+          c.@first_seq.clear(), c.@last_seq.clear(),
+          c.@first_ut.clear(),  c.@last_ut.clear();
+
+  PRINT @@edges_inserted    AS interaction_edges_inserted_in_batch,
+        @@txns_contributing AS transactions_under_cutoff_in_batch,
+        cutoff_event_seq    AS cutoff_used,
+        source_batch        AS source_batch,
+        num_of_source_batches AS source_batch_count,
+        build_id            AS build_id;
+}

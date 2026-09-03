@@ -1,0 +1,143 @@
+/*
+======================================================================
+tgn_window_neighbors — the last-N adjacency Stage 4's attention needs.
+======================================================================
+For every Card and every Merchant, the last `last_n` transaction partners
+STRICTLY BEFORE `bound_event_seq`. One call per WINDOW, not per batch.
+
+======================================================================
+PER WINDOW. NOT PER BATCH. THE DIFFERENCE IS 21 DAYS PER EPOCH.
+======================================================================
+The obvious design -- pass a batch of seeds, get their neighbourhoods --
+was costed on 2026-08-03 at ~28.4M edge visits per batch, which is 1.05
+full passes of the relation to emit ~50k rows. At 4,784 batches per
+epoch that is 21-72 days per epoch. Dead.
+
+Per window it is SIX calls per run, at the forward-chaining cutoffs the
+pipeline already resolves, and each is one pass -- the same shape and
+the same cost as build_interaction_edges, which the run already pays.
+
+THE CLIENT ADVANCES IT FORWARD. After loading a window the trainer
+streams events in order and calls LastNeighborLoader.insert() as it
+goes, so the adjacency stays current between windows without another
+query. And because everything this query returns is strictly EARLIER
+than everything the stream then inserts, last-N of the merge IS true
+last-N: per-seed exact, zero coarsening. That is the property Stage 2's
+cuGraph route could not offer, and the reason a per-fold graph was
+merely "temporally correct by construction" there while this is exact.
+
+======================================================================
+WHY IT TAKES NO SEED LIST
+======================================================================
+No query in this repo has ever taken a collection parameter -- SET and
+BAG appear only as accumulator types -- so a SET<VERTEX> parameter is
+unverified against this instance. It is also unnecessary: a window load
+wants EVERY node's adjacency, so the seed list would be "all of them".
+Batching uses the proven getvid residue idiom instead
+(card_row_temporal.gsql, reset_build.gsql, build_interaction_edges.gsql).
+
+======================================================================
+HeapAccum(last_n, eseq DESC) -- DESC IS LOAD-BEARING
+======================================================================
+On overflow a HeapAccum drops the tuple LAST in sorted order. With DESC
+that is the SMALLEST event_seq, i.e. the oldest neighbour. So overflow
+IS last-N semantics and no truncation gate is needed -- unlike
+card_row_temporal, where ut ASC drops the newest rows and needs
+cards_truncated_MUST_BE_ZERO to catch it.
+
+Returns three flat ListAccum<INT>, not rows-of-dicts: measured at 1.16
+MB and 9.5 ms to decode against 2.36 MB and 23.4 ms for the dict form,
+on a 50k-triple payload. event_seq does double duty as the edge time
+and the message index, because it is a dense unique rank from 1
+(schema.gsql:181, gated by assert_cardinality).
+======================================================================
+*/
+
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY tgn_window_neighbors(
+    UINT bound_event_seq,
+    INT  last_n = 10,
+    INT  source_batch = 0,
+    INT  num_of_source_batches = 1
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  /* FIELD NAMES ARE SCHEMA ATTRIBUTE NAMES, and that is a constraint rather
+     than a choice. validate_stage1_static's check_attributes flags any
+     `alias.field` whose field is not in the 90-name schema set, and a TUPLE
+     iterated as `item.<field>` is indistinguishable from an attribute read to
+     it. `c_id` holds the NEIGHBOUR'S getvid -- defensible, since c_id is
+     itself a getvid in this schema -- and `event_seq` holds the edge time.
+     There is a 13-character-alias escape in that checker; it is an accident
+     of the heuristic and is deliberately not used here. */
+  TYPEDEF TUPLE<UINT c_id, UINT event_seq> Nbr;
+
+  HeapAccum<Nbr>(last_n, event_seq DESC) @heap;
+  /* POPPED INTO A LIST, NOT ITERATED. `FOREACH item IN @heap` does not parse
+     -- no query in this repo does it, and both existing HeapAccum users
+     (card_row_temporal:157, card_interval_max:165) drain with
+     `WHILE size() > 0 DO list += pop() END`. Following the working idiom
+     rather than the one that reads better. */
+  ListAccum<Nbr>                         @drained;
+
+  /* Flat parallel arrays. seed and nbr are the ORIGINAL getvid values;
+     the client maps them into its own dense index space, which is the
+     "new ids every pass" rule from the design docs. */
+  ListAccum<INT> @@seed_vid, @@nbr_vid, @@edge_eseq;
+  SumAccum<INT>  @@pairs, @@seeds_with_history;
+
+  card_batch = SELECT c FROM Card:c
+               WHERE getvid(c) % num_of_source_batches == source_batch;
+
+  /* Card -> Merchant over the flat transaction relation. edge_event_seq,
+     not the destination's event_seq: the predicate is then decidable while
+     walking the adjacency, which is the same substitution
+     build_interaction_edges made on 2026-08-02, and assert_edge_stamp
+     gates that the two are equal. */
+  gather = SELECT c
+      FROM card_batch:c -(Card_Merchant_Transaction>:e)- Merchant:m
+      WHERE e.edge_event_seq > 0 AND e.edge_event_seq < bound_event_seq
+      ACCUM
+        c.@heap += Nbr(getvid(m), e.edge_event_seq),
+        m.@heap += Nbr(getvid(c), e.edge_event_seq);
+
+  emit_c = SELECT c FROM card_batch:c
+      POST-ACCUM
+        IF c.@heap.size() > 0 THEN @@seeds_with_history += 1 END,
+        WHILE c.@heap.size() > 0 DO
+            c.@drained += c.@heap.pop()
+        END,
+        FOREACH item IN c.@drained DO
+            @@seed_vid   += getvid(c),
+            @@nbr_vid    += item.c_id,
+            @@edge_eseq  += item.event_seq,
+            @@pairs      += 1
+        END,
+        c.@heap.clear(), c.@drained.clear();
+
+  /* Merchants are accumulated into by the card-side walk above, so this
+     only drains them. Only meaningful on the LAST batch; the client
+     concatenates across batches either way. */
+  emit_m = SELECT m FROM Merchant:m
+      POST-ACCUM
+        WHILE m.@heap.size() > 0 DO
+            m.@drained += m.@heap.pop()
+        END,
+        FOREACH item IN m.@drained DO
+            @@seed_vid  += getvid(m),
+            @@nbr_vid   += item.c_id,
+            @@edge_eseq += item.event_seq,
+            @@pairs     += 1
+        END,
+        m.@heap.clear(), m.@drained.clear();
+
+  PRINT @@seed_vid AS seed_vid, @@nbr_vid AS nbr_vid,
+        @@edge_eseq AS edge_eseq;
+
+  PRINT @@pairs               AS pairs_returned,
+        @@seeds_with_history  AS seeds_with_history,
+        bound_event_seq       AS bound_used,
+        last_n                AS last_n,
+        source_batch          AS source_batch,
+        num_of_source_batches AS source_batch_count;
+}

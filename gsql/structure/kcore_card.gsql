@@ -1,0 +1,68 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY kcore_card(
+    STRING build_id,
+    INT    min_weight = 0,
+    INT    max_core = 50
+) SYNTAX V1 {
+
+  SumAccum<INT> @deg;
+  OrAccum      @alive;
+  SumAccum<INT> @@peeled_this_round, @@assigned, @@at_cap, @@cards_unseen;
+  MapAccum<INT, SumAccum<INT>> @@core_histogram;
+  MaxAccum<INT> @@max_core_found;
+
+  Seen = SELECT c FROM Card:c WHERE c.seen == TRUE
+         POST-ACCUM c.@alive = TRUE;
+  Remaining = Seen;
+
+  INT k = 1;
+  WHILE Remaining.size() > 0 AND k <= max_core DO
+
+      @@peeled_this_round = 1;
+      WHILE @@peeled_this_round > 0 DO
+          @@peeled_this_round = 0;
+
+          rst = SELECT v FROM Remaining:v POST-ACCUM v.@deg = 0;
+
+          dg = SELECT s FROM Remaining:s -(Card_Card:e)- Card:t
+               WHERE t.@alive == TRUE AND e.weight >= min_weight
+               ACCUM s.@deg += 1;
+
+          low = SELECT v FROM Remaining:v
+                WHERE v.@deg < k
+                POST-ACCUM
+                  v.core_number = k - 1,
+                  v.@alive = FALSE,
+                  @@core_histogram += ((k - 1) -> 1),
+                  @@max_core_found += (k - 1),
+                  @@assigned += 1,
+                  @@peeled_this_round += 1;
+
+          Remaining = Remaining MINUS low;
+      END;
+
+      k = k + 1;
+  END;
+
+  /* whatever survived the cap */
+  cap = SELECT v FROM Remaining:v
+        POST-ACCUM
+          v.core_number = max_core,
+          @@core_histogram += (max_core -> 1),
+          @@at_cap += 1,
+          @@assigned += 1;
+
+  unseen = SELECT c FROM Card:c WHERE c.seen == FALSE
+           POST-ACCUM @@cards_unseen += 1;
+
+  PRINT @@assigned       AS cards_assigned_a_core_number,
+        @@at_cap         AS vertices_at_cap,
+        @@max_core_found AS max_core_number_found,
+        max_core         AS max_core_cap_used,
+        @@cards_unseen   AS cards_unseen_excluded,
+        min_weight       AS min_weight_used,
+        build_id         AS build_id;
+
+  PRINT @@core_histogram AS core_number_histogram;
+}

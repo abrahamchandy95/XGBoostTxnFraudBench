@@ -1,0 +1,90 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY stamp_same_as_provenance(
+    STRING build_id,
+    UINT   cutoff_event_seq,
+    INT    pii_high_connections_limit = 25000
+) FOR GRAPH TF_GNN {
+
+  MapAccum<INT, MaxAccum<INT>> @pii_seq;
+  MapAccum<INT, MaxAccum<INT>> @pii_ut;
+
+  SumAccum<INT>                @@edges_seen;
+  SumAccum<INT>                @@edges_stamped;
+  SumAccum<INT>                @@edges_no_shared_pii;
+  MapAccum<INT, SumAccum<INT>> @@shared_pii_histogram;
+  MaxAccum<INT>                @@max_resolved_at;
+  MinAccum<INT>                @@min_resolved_at;
+  MaxAccum<INT>                @@max_evidence_span;
+
+  SetAccum<STRING> @@edge_type_set;
+
+  @@edge_type_set = (
+    "Party_Has_Birthdate",
+    "Party_Has_Street_Address",
+    "Party_Has_Identity_Document",
+    "Party_Has_Email_Address_Hash",
+    "Party_Has_Name_Hash",
+    "Party_Has_Phone_Hash"
+  );
+
+  all_parties = {Party.*};
+
+  cache = SELECT p
+          FROM all_parties:p -(@@edge_type_set:e)- :v
+          WHERE e.edge_event_seq > 0
+            AND e.edge_event_seq < cutoff_event_seq
+            AND v.outdegree(@@edge_type_set) > 1
+            AND v.outdegree(@@edge_type_set) < pii_high_connections_limit
+          ACCUM p.@pii_seq += (getvid(v) -> e.edge_event_seq),
+                p.@pii_ut  += (getvid(v) -> e.edge_unix_time);
+
+  stamp = SELECT p
+      FROM Party:p -(Same_As:e)- Party:q
+      WHERE getvid(p) < getvid(q)
+      ACCUM
+        @@edges_seen += 1,
+        INT best_seq = 0,
+        INT best_ut  = 0,
+        INT first_seq = 0,
+        INT shared = 0,
+
+        FOREACH (v, s1) IN p.@pii_seq DO
+            IF q.@pii_seq.containsKey(v) THEN
+                shared = shared + 1,
+
+                /* both Parties must be observed holding v */
+                INT ev = s1,
+                IF q.@pii_seq.get(v) > ev THEN ev = q.@pii_seq.get(v) END,
+                INT et = p.@pii_ut.get(v),
+                IF q.@pii_ut.get(v) > et THEN et = q.@pii_ut.get(v) END,
+
+                IF ev > best_seq THEN best_seq = ev END,
+                IF et > best_ut  THEN best_ut  = et END,
+                IF first_seq == 0 OR ev < first_seq THEN first_seq = ev END
+            END
+        END,
+
+        IF shared > 0 THEN
+            e.resolved_at_event_seq = best_seq,
+            e.resolved_at_unix_time = best_ut,
+            @@edges_stamped += 1,
+            @@shared_pii_histogram += (shared -> 1),
+            @@max_resolved_at += best_seq,
+            @@min_resolved_at += best_seq,
+            @@max_evidence_span += (best_seq - first_seq)
+        ELSE
+            @@edges_no_shared_pii += 1
+        END;
+
+  PRINT @@edges_seen           AS same_as_edges_seen,
+        @@edges_stamped        AS same_as_edges_stamped,
+        @@edges_no_shared_pii  AS same_as_edges_with_no_shared_pii_MUST_BE_ZERO,
+        cutoff_event_seq       AS cutoff_used,
+        build_id               AS build_id;
+
+  PRINT @@shared_pii_histogram AS shared_pii_count_histogram,
+        @@min_resolved_at      AS min_resolved_at_event_seq,
+        @@max_resolved_at      AS max_resolved_at_event_seq,
+        @@max_evidence_span    AS max_evidence_span;
+}

@@ -1,0 +1,221 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_relation_edges(
+    STRING relation,
+    STRING build_id = "",
+    INT    page_start = 0,
+    INT    page_size = 2000000
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  TYPEDEF TUPLE<INT src, INT dst, INT time> EdgeRow;
+  ListAccum<EdgeRow> @@rows;
+  SumAccum<INT> @@emitted;
+  SumAccum<INT> @@skipped_no_time;
+
+  MapAccum<INT, MinAccum<INT>> @pair_seq;
+  SumAccum<INT> @@hub_endpoints_excluded;
+
+  INT page_end = page_start + page_size;
+
+  IF relation == "Card_Merchant_Transaction" THEN
+    cards = SELECT c FROM Card:c
+            WHERE getvid(c) >= page_start AND getvid(c) < page_end;
+    res = SELECT c FROM cards:c -(Card_Merchant_Transaction>:e)- Merchant:m
+          ACCUM
+            CASE WHEN e.edge_event_seq > 0 THEN
+                @@rows += EdgeRow(getvid(c), getvid(m), e.edge_event_seq),
+                @@emitted += 1
+              ELSE @@skipped_no_time += 1 END;
+
+  ELSE IF relation == "Card_Send_Transaction" THEN
+    cards = SELECT c FROM Card:c
+            WHERE getvid(c) >= page_start AND getvid(c) < page_end;
+    res = SELECT c FROM cards:c -(Card_Send_Transaction>:e)- Payment_Transaction:t
+          ACCUM
+            CASE WHEN e.edge_event_seq > 0 THEN
+                @@rows += EdgeRow(getvid(c), getvid(t), e.edge_event_seq),
+                @@emitted += 1
+              ELSE @@skipped_no_time += 1 END;
+
+  ELSE IF relation == "Transaction_To_Merchant" THEN
+    txns = SELECT t FROM Payment_Transaction:t
+           WHERE getvid(t) >= page_start AND getvid(t) < page_end;
+    res = SELECT t FROM txns:t -(Transaction_To_Merchant>:e)- Merchant:m
+          ACCUM
+            CASE WHEN e.edge_event_seq > 0 THEN
+                @@rows += EdgeRow(getvid(t), getvid(m), e.edge_event_seq),
+                @@emitted += 1
+              ELSE @@skipped_no_time += 1 END;
+
+  ELSE IF relation == "Has_Interaction_With_Merchant" THEN
+    cards = SELECT c FROM Card:c
+            WHERE getvid(c) >= page_start AND getvid(c) < page_end;
+    res = SELECT c FROM cards:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+          WHERE e.build_id == build_id
+          ACCUM
+            CASE WHEN e.first_event_seq > 0 THEN
+                @@rows += EdgeRow(getvid(c), getvid(m), e.first_event_seq),
+                @@emitted += 1
+              ELSE @@skipped_no_time += 1 END;
+
+  ELSE IF relation == "Party_Has_Card" THEN
+    parties = SELECT p FROM Party:p
+              WHERE getvid(p) >= page_start AND getvid(p) < page_end;
+    res = SELECT p FROM parties:p -(Party_Has_Card>:e)- Card:c
+          ACCUM
+            CASE WHEN e.edge_event_seq > 0 THEN
+                @@rows += EdgeRow(getvid(p), getvid(c), e.edge_event_seq),
+                @@emitted += 1
+              ELSE @@skipped_no_time += 1 END;
+
+  ELSE IF relation == "Party_Is_Merchant" THEN
+    parties = SELECT p FROM Party:p
+              WHERE getvid(p) >= page_start AND getvid(p) < page_end;
+    res = SELECT p FROM parties:p -(Party_Is_Merchant>:e)- Merchant:m
+          ACCUM
+            CASE WHEN e.edge_event_seq > 0 THEN
+                @@rows += EdgeRow(getvid(p), getvid(m), e.edge_event_seq),
+                @@emitted += 1
+              ELSE @@skipped_no_time += 1 END;
+
+  ELSE IF relation == "Merchant_Assigned" THEN
+    merchants = SELECT m FROM Merchant:m
+                WHERE getvid(m) >= page_start AND getvid(m) < page_end;
+    res = SELECT m FROM merchants:m -(Merchant_Assigned:e)- Merchant_Category:k
+          ACCUM
+            CASE WHEN m.first_seen_event_seq > 0 THEN
+                @@rows += EdgeRow(getvid(m), getvid(k), m.first_seen_event_seq),
+                @@emitted += 1
+              ELSE @@skipped_no_time += 1 END;
+
+  ELSE IF relation == "Party_Shares_Device" THEN
+    hubs = SELECT d FROM Device:d
+           WHERE d.outdegree("Party_Has_Device") >= 1000
+           POST-ACCUM (d) @@hub_endpoints_excluded += 1;
+    parties = SELECT p FROM Party:p
+              WHERE getvid(p) >= page_start AND getvid(p) < page_end;
+    res = SELECT q
+          FROM parties:p -(Party_Has_Device:e1)- Device:d
+               -(Party_Has_Device:e2)- Party:q
+          WHERE e1.edge_event_seq > 0 AND e2.edge_event_seq > 0
+            AND d.outdegree("Party_Has_Device") < 1000
+          ACCUM
+            IF getvid(p) != getvid(q) THEN
+              INT visible = e1.edge_event_seq,
+              IF e2.edge_event_seq > visible THEN
+                visible = e2.edge_event_seq
+              END,
+              q.@pair_seq += (getvid(p) -> visible)
+            END
+          POST-ACCUM
+            FOREACH (src_vid, seq) IN q.@pair_seq DO
+              @@rows += EdgeRow(src_vid, getvid(q), seq),
+              @@emitted += 1
+            END,
+            q.@pair_seq.clear();
+
+  ELSE IF relation == "Party_Shares_IP" THEN
+    hubs = SELECT n FROM IP:n
+           WHERE n.outdegree("Party_Has_IP") >= 1000
+           POST-ACCUM (n) @@hub_endpoints_excluded += 1;
+    parties = SELECT p FROM Party:p
+              WHERE getvid(p) >= page_start AND getvid(p) < page_end;
+    res = SELECT q
+          FROM parties:p -(Party_Has_IP:e1)- IP:n
+               -(Party_Has_IP:e2)- Party:q
+          WHERE e1.edge_event_seq > 0 AND e2.edge_event_seq > 0
+            AND n.outdegree("Party_Has_IP") < 1000
+          ACCUM
+            IF getvid(p) != getvid(q) THEN
+              INT visible = e1.edge_event_seq,
+              IF e2.edge_event_seq > visible THEN
+                visible = e2.edge_event_seq
+              END,
+              q.@pair_seq += (getvid(p) -> visible)
+            END
+          POST-ACCUM
+            FOREACH (src_vid, seq) IN q.@pair_seq DO
+              @@rows += EdgeRow(src_vid, getvid(q), seq),
+              @@emitted += 1
+            END,
+            q.@pair_seq.clear();
+
+  ELSE
+    PRINT "unknown relation" AS ABORT_unknown_relation, relation AS requested;
+  END;
+
+  PRINT @@rows            AS edges,
+        @@emitted         AS rows_returned,
+        @@skipped_no_time AS skipped_unknown_event_seq_MUST_BE_ZERO,
+        @@hub_endpoints_excluded AS hub_endpoints_excluded,
+        relation          AS relation,
+        page_start        AS page_start,
+        page_size         AS page_size;
+}
+
+
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_vertex_id_range(
+    STRING node_type
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  MinAccum<INT> @@min_vid;
+  MaxAccum<INT> @@max_vid;
+  SumAccum<INT> @@vertex_count;
+
+  IF node_type == "Card" THEN
+    res = SELECT v FROM Card:v
+          POST-ACCUM (v) @@min_vid += getvid(v), @@max_vid += getvid(v),
+                         @@vertex_count += 1;
+  ELSE IF node_type == "Merchant" THEN
+    res = SELECT v FROM Merchant:v
+          POST-ACCUM (v) @@min_vid += getvid(v), @@max_vid += getvid(v),
+                         @@vertex_count += 1;
+  ELSE IF node_type == "Payment_Transaction" THEN
+    res = SELECT v FROM Payment_Transaction:v
+          POST-ACCUM (v) @@min_vid += getvid(v), @@max_vid += getvid(v),
+                         @@vertex_count += 1;
+  ELSE IF node_type == "Party" THEN
+    res = SELECT v FROM Party:v
+          POST-ACCUM (v) @@min_vid += getvid(v), @@max_vid += getvid(v),
+                         @@vertex_count += 1;
+  ELSE
+    PRINT "unknown node_type" AS ABORT_unknown_node_type,
+          node_type AS requested;
+  END;
+
+  PRINT @@min_vid      AS min_vid,
+        @@max_vid      AS max_vid,
+        @@vertex_count AS vertex_count,
+        node_type      AS node_type;
+}
+
+
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_vertex_key_map(
+    STRING node_type
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  TYPEDEF TUPLE<INT vid, STRING key> VertexRow;
+  ListAccum<VertexRow> @@rows;
+  SumAccum<INT> @@emitted;
+
+  IF node_type == "Card" THEN
+    res = SELECT c FROM Card:c
+          POST-ACCUM @@rows += VertexRow(getvid(c), c.card_number),
+                     @@emitted += 1;
+  ELSE IF node_type == "Merchant" THEN
+    res = SELECT m FROM Merchant:m
+          POST-ACCUM @@rows += VertexRow(getvid(m), m.id),
+                     @@emitted += 1;
+  ELSE
+    PRINT "only Card and Merchant have maps" AS ABORT_unknown_node_type,
+          node_type AS requested;
+  END;
+
+  PRINT @@rows    AS vertices,
+        @@emitted AS rows_returned,
+        node_type AS node_type;
+}

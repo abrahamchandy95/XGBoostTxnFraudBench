@@ -1,0 +1,43 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_embedding_features(STRING build_id)
+  FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @@card_rows, @@merchant_rows;
+
+  Cards = SELECT c FROM Card:c
+          WHERE c.build_id == build_id AND c.seen == TRUE
+          POST-ACCUM @@card_rows += 1;
+
+  PRINT Cards[
+      Cards.card_number,
+      Cards.build_id,
+      Cards.fastrp,
+      Cards.nbr_pagerank_mean,
+      Cards.nbr_pagerank_max,
+      Cards.nbr_c_size_mean,
+      Cards.nbr_c_size_max,
+      Cards.nbr_txn_count_mean,
+      Cards.nbr_txn_count_max
+  ] AS card_embedding_features;
+
+  Merchants = SELECT m FROM Merchant:m
+              WHERE m.build_id == build_id AND m.seen == TRUE
+              POST-ACCUM @@merchant_rows += 1;
+
+  PRINT Merchants[
+      Merchants.id,
+      Merchants.build_id,
+      Merchants.fastrp,
+      Merchants.nbr_pagerank_mean,
+      Merchants.nbr_pagerank_max,
+      Merchants.nbr_c_size_mean,
+      Merchants.nbr_c_size_max,
+      Merchants.nbr_txn_count_mean,
+      Merchants.nbr_txn_count_max
+  ] AS merchant_embedding_features;
+
+  PRINT @@card_rows     AS card_rows_returned,
+        @@merchant_rows AS merchant_rows_returned,
+        build_id        AS build_id;
+}

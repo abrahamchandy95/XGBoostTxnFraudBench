@@ -1,0 +1,44 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY export_transaction_rows(
+    UINT from_event_seq,
+    UINT to_event_seq
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT> @@rows, @@frauds;
+  MapAccum<INT, SumAccum<INT>> @@split_histogram;
+
+  Rows = SELECT t FROM Payment_Transaction:t
+         WHERE t.event_seq >= from_event_seq
+           AND t.event_seq <  to_event_seq
+         POST-ACCUM
+           @@rows += 1,
+           IF t.is_fraud == 1 THEN @@frauds += 1 END,
+           @@split_histogram += (t.split_id -> 1);
+
+  PRINT Rows[
+      Rows.id,
+
+      Rows.card_number,    
+      Rows.merchant_id,   
+      Rows.mer_cat,      
+
+      Rows.event_seq,
+      Rows.unix_time,
+      Rows.split_id,
+      Rows.causal_fold,
+
+      Rows.amount,
+      Rows.use_chip,
+      Rows.error,
+      Rows.is_online,
+
+      Rows.is_fraud
+  ] AS transaction_rows;
+
+  PRINT @@rows            AS rows_returned,
+        @@frauds          AS frauds_in_page,
+        @@split_histogram AS rows_per_split_in_page,
+        from_event_seq    AS from_event_seq,
+        to_event_seq      AS to_event_seq;
+}

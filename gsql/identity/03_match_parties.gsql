@@ -1,0 +1,158 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY match_parties(
+  UINT  cutoff_event_seq,
+
+  FLOAT birthdate_weight = 0.5,
+  FLOAT street_address_weight = 0.2,
+
+  FLOAT email_weight = 0.5,
+  FLOAT name_weight = 0.2,
+  FLOAT phone_weight = 0.5,
+
+  FLOAT identity_document_weight = 0.6,
+
+  INT   num_of_source_batches = 10,
+  FLOAT threshold = 1.0,
+  INT   pii_low_connections_limit = 100,
+  INT   pii_high_connections_limit = 25000
+) FOR GRAPH TF_GNN {
+
+  ListAccum<VERTEX<Party>>                 @party_list;
+  MapAccum<VERTEX<Party>, SumAccum<FLOAT>> @party_map;
+  OrAccum                                  @is_candidate;
+
+  SetAccum<INT>  @@matched_vids;
+
+  SumAccum<INT>   @@pairs_matched;
+  MaxAccum<FLOAT> @@max_score;
+  MinAccum<FLOAT> @@min_score;
+  AvgAccum        @@avg_score;
+  MapAccum<INT, SumAccum<INT>> @@score_histogram;
+  SumAccum<INT>   @@source_parties, @@low_degree_piis, @@candidate_piis;
+
+  MapAccum<STRING, SumAccum<INT>> @@evidence_by_type;
+
+  SetAccum<STRING>                  @@edge_type_set;
+  MapAccum<STRING, MaxAccum<FLOAT>> @@type_weight;
+
+  @@edge_type_set = (
+    "Party_Has_Birthdate",
+    "Party_Has_Street_Address",
+    "Party_Has_Identity_Document",
+    "Party_Has_Email_Address_Hash",
+    "Party_Has_Name_Hash",
+    "Party_Has_Phone_Hash"
+  );
+
+  @@type_weight += ("Party_Has_Birthdate"          -> birthdate_weight);
+  @@type_weight += ("Party_Has_Street_Address"     -> street_address_weight);
+  @@type_weight += ("Party_Has_Identity_Document"  -> identity_document_weight);
+  @@type_weight += ("Party_Has_Email_Address_Hash" -> email_weight);
+  @@type_weight += ("Party_Has_Name_Hash"          -> name_weight);
+  @@type_weight += ("Party_Has_Phone_Hash"         -> phone_weight);
+
+  DATETIME start_time = now();
+
+  all_parties = {Party.*};
+
+  FOREACH i IN RANGE[0, num_of_source_batches-1] DO
+
+      batched = SELECT s FROM all_parties:s
+                WHERE getvid(s) % num_of_source_batches == i
+                  AND s.first_seen_event_seq > 0
+                  AND s.first_seen_event_seq < cutoff_event_seq
+                POST-ACCUM @@source_parties += 1;
+
+      batched = SELECT s
+          FROM batched:s -(@@edge_type_set:e)- :t
+          WHERE e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+            AND t.outdegree(@@edge_type_set) > 1
+            AND t.outdegree(@@edge_type_set) < pii_low_connections_limit;
+
+      low_degree_piis = SELECT t
+          FROM batched:s -(@@edge_type_set:e)- :t
+          WHERE e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+            AND t.outdegree(@@edge_type_set) > 1
+            AND t.outdegree(@@edge_type_set) < pii_low_connections_limit
+          POST-ACCUM @@low_degree_piis += 1;
+
+      piis = SELECT t
+          FROM batched:s -(@@edge_type_set:e)- :t
+          WHERE e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+            AND t.outdegree(@@edge_type_set) > 1
+            AND t.outdegree(@@edge_type_set) < pii_high_connections_limit
+          ACCUM t.@party_list += s
+          POST-ACCUM @@candidate_piis += 1;
+
+      seeded = SELECT t
+          FROM low_degree_piis:s -(@@edge_type_set:e)- Party:t
+          WHERE e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+            AND t.first_seen_event_seq > 0
+            AND t.first_seen_event_seq < cutoff_event_seq
+          ACCUM
+            t.@is_candidate += TRUE,
+            FOREACH v IN s.@party_list DO
+              IF getvid(v) < getvid(t) THEN
+                t.@party_map += (v -> 0.0)
+              END
+            END;
+
+      scored = SELECT t
+          FROM piis:s -(@@edge_type_set:e)- Party:t
+          WHERE t.@is_candidate == TRUE
+            AND e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+          ACCUM
+            FLOAT w = @@type_weight.get(e.type),
+            FOREACH v IN s.@party_list DO
+              IF t.@party_map.containsKey(v) THEN
+                t.@party_map += (v -> w),
+                @@evidence_by_type += (e.type -> 1)
+              END
+            END
+
+          POST-ACCUM
+            FOREACH (k, v) IN t.@party_map DO
+              FLOAT full_score = 0.0 + v,
+
+              @@max_score += full_score,
+              @@min_score += full_score,
+              @@avg_score += full_score,
+              @@score_histogram += (float_to_int(full_score * 10) -> 1),
+
+              IF full_score > (threshold - 0.000001) THEN
+                INSERT INTO Same_As (FROM, TO, score) VALUES (t, k, full_score),
+                @@matched_vids += getvid(t),
+                @@matched_vids += getvid(k),
+                @@pairs_matched += 1
+              END
+            END,
+
+            t.@party_map.clear(),
+            t.@is_candidate = FALSE;
+
+      cleared = SELECT s FROM piis:s
+          POST-ACCUM s.@party_list.clear();
+
+  END;   /* source batching */
+
+  INT parties_matched = @@matched_vids.size();
+  STRING execution_time = to_string(datetime_diff(now(), start_time));
+
+  PRINT parties_matched   AS parties_with_at_least_one_match,
+        @@pairs_matched   AS same_as_edges_inserted,
+        @@source_parties  AS source_parties_under_cutoff,
+        @@low_degree_piis AS blocking_pii_vertices,
+        @@candidate_piis  AS scored_pii_vertices,
+        cutoff_event_seq  AS cutoff_used,
+        threshold         AS threshold_used;
+
+  PRINT @@score_histogram AS score_histogram_tenths,
+        @@max_score AS max_score, @@min_score AS min_score,
+        @@avg_score AS avg_score;
+
+  PRINT @@evidence_by_type AS scored_relations,
+        @@type_weight      AS weights_used;
+
+  PRINT execution_time AS execution_time_in_seconds;
+}

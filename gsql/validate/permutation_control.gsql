@@ -1,0 +1,156 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY permutation_control(
+    STRING build_id_in,
+    STRING build_id_out,
+    INT    min_stratum_size = 5,
+    INT    random_seed = 42
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  MapAccum<INT, MaxAccum<FLOAT>> @@snap_pagerank;
+  MapAccum<INT, MaxAccum<INT>>   @@snap_c_size;
+  MapAccum<INT, MaxAccum<INT>>   @@snap_louvain_size;
+  MapAccum<INT, MaxAccum<INT>>   @@snap_core_number;
+  MapAccum<INT, MaxAccum<INT>>   @@snap_repeat;
+
+  MapAccum<INT, ListAccum<INT>>  @@card_strata;
+  MapAccum<INT, ListAccum<INT>>  @@merchant_strata;
+  MapAccum<INT, SumAccum<INT>>   @@card_stratum_sizes;
+  MapAccum<INT, SumAccum<INT>>   @@merchant_stratum_sizes;
+
+  SumAccum<INT> @@cards_shuffled, @@cards_untouched;
+  SumAccum<INT> @@merchants_shuffled, @@merchants_untouched;
+  SumAccum<INT> @@small_strata;
+  SumAccum<INT> @@self_assignments;
+
+  Cards = SELECT c FROM Card:c
+          WHERE c.build_id == build_id_in AND c.seen == TRUE;
+
+  Merchants = SELECT m FROM Merchant:m
+              WHERE m.build_id == build_id_in AND m.seen == TRUE;
+
+
+  snc = SELECT c FROM Cards:c
+      POST-ACCUM
+        INT v = getvid(c),
+        @@snap_pagerank     += (v -> c.pagerank),
+        @@snap_c_size       += (v -> c.c_size),
+        @@snap_louvain_size += (v -> c.louvain_size),
+        @@snap_core_number  += (v -> c.core_number),
+        @@snap_repeat       += (v -> c.repeated_merchant_count),
+
+        INT b = 7,
+        IF c.distinct_merchant_count <= 1 THEN b = 0
+        ELSE IF c.distinct_merchant_count <= 2 THEN b = 1
+        ELSE IF c.distinct_merchant_count <= 4 THEN b = 2
+        ELSE IF c.distinct_merchant_count <= 8 THEN b = 3
+        ELSE IF c.distinct_merchant_count <= 16 THEN b = 4
+        ELSE IF c.distinct_merchant_count <= 64 THEN b = 5
+        ELSE IF c.distinct_merchant_count <= 256 THEN b = 6
+        END,
+        @@card_strata += (b -> v),
+        @@card_stratum_sizes += (b -> 1);
+
+  snm = SELECT m FROM Merchants:m
+      POST-ACCUM
+        INT v = getvid(m),
+        @@snap_pagerank     += (v -> m.pagerank),
+        @@snap_c_size       += (v -> m.c_size),
+        @@snap_louvain_size += (v -> m.louvain_size),
+        @@snap_core_number  += (v -> m.core_number),
+        @@snap_repeat       += (v -> m.repeated_card_count),
+
+        INT b = 7,
+        IF m.distinct_card_count <= 1 THEN b = 0
+        ELSE IF m.distinct_card_count <= 2 THEN b = 1
+        ELSE IF m.distinct_card_count <= 4 THEN b = 2
+        ELSE IF m.distinct_card_count <= 8 THEN b = 3
+        ELSE IF m.distinct_card_count <= 16 THEN b = 4
+        ELSE IF m.distinct_card_count <= 64 THEN b = 5
+        ELSE IF m.distinct_card_count <= 256 THEN b = 6
+        END,
+        @@merchant_strata += (b -> v),
+        @@merchant_stratum_sizes += (b -> 1);
+
+  FOREACH (b, n) IN @@card_stratum_sizes DO
+      IF n < min_stratum_size THEN @@small_strata += 1; END;
+  END;
+  FOREACH (b, n) IN @@merchant_stratum_sizes DO
+      IF n < min_stratum_size THEN @@small_strata += 1; END;
+  END;
+
+
+  swc = SELECT c FROM Cards:c
+      POST-ACCUM
+        INT b = 7,
+        IF c.distinct_merchant_count <= 1 THEN b = 0
+        ELSE IF c.distinct_merchant_count <= 2 THEN b = 1
+        ELSE IF c.distinct_merchant_count <= 4 THEN b = 2
+        ELSE IF c.distinct_merchant_count <= 8 THEN b = 3
+        ELSE IF c.distinct_merchant_count <= 16 THEN b = 4
+        ELSE IF c.distinct_merchant_count <= 64 THEN b = 5
+        ELSE IF c.distinct_merchant_count <= 256 THEN b = 6
+        END,
+        INT n = @@card_strata.get(b).size(),
+        IF n < min_stratum_size THEN
+            c.build_id = build_id_out,
+            @@cards_untouched += 1
+        ELSE
+            INT r = (getvid(c) + 1) * 2654435761 % 2147483647,
+            r = (r + random_seed * 40503) % 2147483647,
+            r = (r * 1103515245 + 12345) % 2147483647,
+            INT dv = @@card_strata.get(b).get(r % n),
+            IF dv == getvid(c) THEN @@self_assignments += 1 END,
+            c.pagerank = @@snap_pagerank.get(dv),
+            c.c_size = @@snap_c_size.get(dv),
+            c.louvain_size = @@snap_louvain_size.get(dv),
+            c.core_number = @@snap_core_number.get(dv),
+            c.repeated_merchant_count = @@snap_repeat.get(dv),
+            c.build_id = build_id_out,
+            @@cards_shuffled += 1
+        END;
+
+  swm = SELECT m FROM Merchants:m
+      POST-ACCUM
+        INT b = 7,
+        IF m.distinct_card_count <= 1 THEN b = 0
+        ELSE IF m.distinct_card_count <= 2 THEN b = 1
+        ELSE IF m.distinct_card_count <= 4 THEN b = 2
+        ELSE IF m.distinct_card_count <= 8 THEN b = 3
+        ELSE IF m.distinct_card_count <= 16 THEN b = 4
+        ELSE IF m.distinct_card_count <= 64 THEN b = 5
+        ELSE IF m.distinct_card_count <= 256 THEN b = 6
+        END,
+        INT n = @@merchant_strata.get(b).size(),
+        IF n < min_stratum_size THEN
+            m.build_id = build_id_out,
+            @@merchants_untouched += 1
+        ELSE
+            INT r = (getvid(m) + 1) * 2654435761 % 2147483647,
+            r = (r + random_seed * 40503) % 2147483647,
+            r = (r * 1103515245 + 12345) % 2147483647,
+            INT dv = @@merchant_strata.get(b).get(r % n),
+            IF dv == getvid(m) THEN @@self_assignments += 1 END,
+            m.pagerank = @@snap_pagerank.get(dv),
+            m.c_size = @@snap_c_size.get(dv),
+            m.louvain_size = @@snap_louvain_size.get(dv),
+            m.core_number = @@snap_core_number.get(dv),
+            m.repeated_card_count = @@snap_repeat.get(dv),
+            m.build_id = build_id_out,
+            @@merchants_shuffled += 1
+        END;
+
+  PRINT @@cards_shuffled      AS cards_shuffled,
+        @@cards_untouched     AS cards_untouched_small_stratum,
+        @@merchants_shuffled  AS merchants_shuffled,
+        @@merchants_untouched AS merchants_untouched_small_stratum,
+        @@self_assignments    AS self_assignments_dilutes_the_control,
+        @@small_strata        AS donor_strata_below_min_size;
+
+  PRINT @@card_stratum_sizes     AS card_stratum_sizes,
+        @@merchant_stratum_sizes AS merchant_stratum_sizes,
+        random_seed              AS random_seed_used,
+        min_stratum_size         AS min_stratum_size_used,
+        build_id_in              AS build_id_in,
+        build_id_out             AS build_id_out;
+}

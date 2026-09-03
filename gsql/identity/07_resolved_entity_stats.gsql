@@ -1,0 +1,107 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY resolved_entity_stats(
+    STRING build_id,
+    UINT   cutoff_event_seq
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT>            @members;
+  SetAccum<INT>            @pii_set;
+  SetAccum<VERTEX<Card>>   @card_set;
+  SetAccum<VERTEX<Merchant>> @merchant_set;
+  SumAccum<INT>            @card_visits;
+
+  MapAccum<INT, MaxAccum<FLOAT>> @@max_score_by_reid;
+
+  SumAccum<INT> @@entities, @@empty_entities;
+  SumAccum<INT> @@future_evidence, @@unstamped_evidence, @@in_scope_evidence;
+  SumAccum<INT> @@cards_shared;
+  MapAccum<INT, SumAccum<INT>> @@member_count_histogram;
+
+  SetAccum<STRING> @@edge_type_set;
+
+  @@edge_type_set = (
+    "Party_Has_Birthdate",
+    "Party_Has_Street_Address",
+    "Party_Has_Identity_Document",
+    "Party_Has_Email_Address_Hash",
+    "Party_Has_Name_Hash",
+    "Party_Has_Phone_Hash"
+  );
+
+  mem = SELECT r
+        FROM Resolved_Entity:r -(Party_Resolved_As:e)- Party:p
+        WHERE p.first_seen_event_seq > 0
+          AND p.first_seen_event_seq < cutoff_event_seq
+        ACCUM r.@members += 1;
+
+  pii = SELECT r
+        FROM Resolved_Entity:r -(Party_Resolved_As:e1)- Party:p
+                               -(@@edge_type_set:e2)- :v
+        WHERE p.first_seen_event_seq > 0
+          AND p.first_seen_event_seq < cutoff_event_seq
+          AND e2.edge_event_seq > 0
+          AND e2.edge_event_seq < cutoff_event_seq
+        ACCUM r.@pii_set += getvid(v);
+
+  cds = SELECT r
+        FROM Resolved_Entity:r -(Party_Resolved_As:e1)- Party:p
+                               -(Party_Has_Card>:e2)- Card:c
+        WHERE p.first_seen_event_seq > 0
+          AND p.first_seen_event_seq < cutoff_event_seq
+          AND e2.edge_event_seq > 0
+          AND e2.edge_event_seq < cutoff_event_seq
+        ACCUM r.@card_set += c, r.@card_visits += 1;
+
+  mch = SELECT r
+        FROM Resolved_Entity:r -(Party_Resolved_As:e1)- Party:p
+                               -(Party_Is_Merchant>:e2)- Merchant:m
+        WHERE p.first_seen_event_seq > 0
+          AND p.first_seen_event_seq < cutoff_event_seq
+          AND e2.edge_event_seq > 0
+          AND e2.edge_event_seq < cutoff_event_seq
+        ACCUM r.@merchant_set += m;
+
+  sa = SELECT p
+       FROM Party:p -(Same_As:e)- Party:q
+       WHERE getvid(p) < getvid(q) AND p.re_id == q.re_id AND p.re_id != -1
+       ACCUM
+         @@max_score_by_reid += (p.re_id -> e.score),
+         IF e.resolved_at_event_seq == 0 THEN
+             @@unstamped_evidence += 1
+         ELSE IF e.resolved_at_event_seq >= cutoff_event_seq THEN
+             @@future_evidence += 1
+         ELSE
+             @@in_scope_evidence += 1
+         END;
+
+  w = SELECT r FROM Resolved_Entity:r
+      POST-ACCUM
+        r.build_id = build_id,
+        IF r.@members > 0 THEN
+            r.member_count = r.@members,
+            r.distinct_pii_count = r.@pii_set.size(),
+            r.connected_card_count = r.@card_set.size(),
+            r.connected_merchant_count = r.@merchant_set.size(),
+            IF @@max_score_by_reid.containsKey(r.reid) THEN
+                r.max_pair_score = @@max_score_by_reid.get(r.reid)
+            END,
+            @@entities += 1,
+            @@member_count_histogram += (r.@members -> 1),
+            @@cards_shared += (r.@card_visits - r.@card_set.size())
+        ELSE
+            @@empty_entities += 1
+        END;
+
+  PRINT @@entities       AS resolved_entities_with_members_under_cutoff,
+        @@empty_entities AS resolved_entities_empty_under_cutoff,
+        @@cards_shared   AS cards_shared_across_parties,
+        cutoff_event_seq AS cutoff_used,
+        build_id         AS build_id;
+
+  PRINT @@unstamped_evidence AS same_as_unstamped_MUST_BE_ZERO,
+        @@future_evidence    AS same_as_evidence_at_or_after_cutoff,
+        @@in_scope_evidence  AS same_as_evidence_under_cutoff;
+
+  PRINT @@member_count_histogram AS member_count_histogram;
+}

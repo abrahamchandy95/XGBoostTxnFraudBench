@@ -1,0 +1,24 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_community_features(STRING build_id) FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @@rows;
+
+  Comms = SELECT k FROM Community:k
+          WHERE k.build_id == build_id
+          POST-ACCUM @@rows += 1;
+
+  PRINT Comms[
+      Comms.cid,
+      Comms.build_id,
+      Comms.entity_family,
+      Comms.member_count,
+      Comms.txn_count,
+      Comms.total_amount,
+      Comms.max_amount,
+      Comms.min_amount,
+      Comms.avg_amount
+  ] AS community_features;
+
+  PRINT @@rows AS rows_returned, build_id AS build_id;
+}

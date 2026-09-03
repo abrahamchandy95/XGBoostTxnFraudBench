@@ -1,0 +1,102 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY louvain_merchant(
+    STRING build_id,
+    INT    min_weight = 0,
+    INT    max_iteration = 20
+) SYNTAX V1 {
+
+  SumAccum<FLOAT> @k;
+  SumAccum<INT>   @comm;
+  MapAccum<INT, SumAccum<FLOAT>> @k_to;
+
+  MapAccum<INT, SumAccum<FLOAT>> @@comm_tot;
+  MapAccum<INT, SumAccum<FLOAT>> @@in2;   
+  MapAccum<INT, SumAccum<INT>>   @@sizes, @@size_histogram;
+
+  SumAccum<FLOAT> @@two_m;               
+  SumAccum<INT>   @@moved, @@iterations, @@communities, @@merchants_unseen;
+  MaxAccum<INT>   @@largest;
+  SumAccum<FLOAT> @@modularity;
+
+  Seen = SELECT m FROM Merchant:m WHERE m.seen == TRUE;
+
+  dg = SELECT s FROM Seen:s -(Merchant_Merchant:e)- Merchant:t
+       WHERE t.seen == TRUE AND e.weight >= min_weight
+       ACCUM s.@k += e.weight;
+
+  ini = SELECT s FROM Seen:s
+        POST-ACCUM s.@comm = getvid(s), @@two_m += s.@k;
+
+  @@moved = 1;
+  WHILE @@moved > 0 LIMIT max_iteration DO
+      @@moved = 0;
+      @@iterations += 1;
+
+      @@comm_tot.clear();
+      tot = SELECT s FROM Seen:s POST-ACCUM @@comm_tot += (s.@comm -> s.@k);
+
+      nbr = SELECT s FROM Seen:s -(Merchant_Merchant:e)- Merchant:t
+            WHERE t.seen == TRUE AND e.weight >= min_weight
+            ACCUM s.@k_to += (t.@comm -> e.weight);
+
+      mv = SELECT s FROM Seen:s
+          POST-ACCUM
+            INT best_comm = s.@comm,
+            FLOAT best_gain = 0 - 1000000000,
+            FOREACH (c, kic) IN s.@k_to DO
+                FLOAT sigma = @@comm_tot.get(c),
+                IF c == s.@comm THEN sigma = sigma - s.@k END,
+                FLOAT gain = kic - (sigma * s.@k) / @@two_m,
+                IF gain > best_gain THEN
+                    best_gain = gain, best_comm = c
+                ELSE IF gain == best_gain AND c < best_comm THEN
+                    best_comm = c      
+                END
+            END,
+            IF best_comm != s.@comm THEN
+                s.@comm = best_comm, @@moved += 1
+            END,
+            s.@k_to.clear();
+  END;
+
+  sz = SELECT s FROM Seen:s POST-ACCUM @@sizes += (s.@comm -> 1);
+
+  @@comm_tot.clear();
+  tot2 = SELECT s FROM Seen:s POST-ACCUM @@comm_tot += (s.@comm -> s.@k);
+
+  inw = SELECT s FROM Seen:s -(Merchant_Merchant:e)- Merchant:t
+        WHERE t.seen == TRUE AND e.weight >= min_weight
+          AND s.@comm == t.@comm
+        ACCUM @@in2 += (s.@comm -> e.weight);
+
+  wr = SELECT s FROM Seen:s
+       POST-ACCUM
+         INT n = @@sizes.get(s.@comm),
+         s.louvain_id = s.@comm,
+         s.louvain_size = n,
+         @@largest += n;
+
+  unseen = SELECT m FROM Merchant:m WHERE m.seen == FALSE
+           POST-ACCUM @@merchants_unseen += 1;
+
+  FOREACH (c, n) IN @@sizes DO
+      @@communities += 1;
+      @@size_histogram += (n -> 1);
+      FLOAT dC = @@comm_tot.get(c);
+      FLOAT lC2 = 0;
+      IF @@in2.containsKey(c) THEN lC2 = @@in2.get(c); END;
+      @@modularity += (lC2 / @@two_m) - (dC / @@two_m) * (dC / @@two_m);
+  END;
+
+  PRINT @@communities   AS louvain_community_count,
+        @@largest       AS largest_community_size,
+        @@modularity    AS modularity_Q,
+        @@iterations    AS iterations_run,
+        max_iteration   AS iteration_limit,
+        @@merchants_unseen  AS merchants_unseen_excluded,
+        min_weight      AS min_weight_used,
+        build_id        AS build_id;
+
+  PRINT @@size_histogram AS louvain_size_histogram;
+}

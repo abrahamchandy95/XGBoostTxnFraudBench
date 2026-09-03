@@ -1,0 +1,19 @@
+pyTigerGraph>=1.8
+PyYAML==6.0.3
+pydantic>=2
+pydantic-settings>=2
+pandas>=2
+pyarrow>=15
+numpy>=1.26
+xgboost>=2
+scikit-learn>=1.4
+matplotlib>=3.8
+
+# GPU stack: pinned to the tested CUDA 13.2 build
+torch==2.13.0+cu132
+torchvision==0.28.0+cu132
+torch-geometric>=2.7
+
+pandas-stubs==3.0.3.260530
+types-PyYAML==6.0.12.20260518
+scikit-learn-stubs==0.0.3

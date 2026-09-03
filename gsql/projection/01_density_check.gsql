@@ -1,0 +1,109 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY projection_density_check(
+    STRING build_id,
+    INT    top_k = 25,
+    INT    probe_cap = 0,
+    DOUBLE pair_budget = 0
+) FOR GRAPH TF_GNN {
+
+  TYPEDEF TUPLE<STRING id, INT degree> DegreeEntry;
+
+  SumAccum<INT>    @deg;
+  SumAccum<INT>    @repeat_deg;
+
+  HeapAccum<DegreeEntry>(top_k, degree DESC) @@top_merchants;
+  HeapAccum<DegreeEntry>(top_k, degree DESC) @@top_cards;
+
+  SumAccum<DOUBLE> @@cc_candidates, @@mm_candidates;
+  SumAccum<DOUBLE> @@seen_cards, @@seen_merchants;
+  SumAccum<DOUBLE> @@interaction_edges, @@repeat_interaction_edges;
+  MaxAccum<INT>    @@max_merchant_degree, @@max_card_degree;
+
+  SumAccum<DOUBLE> @@merchant_degree_sq;
+
+  SumAccum<DOUBLE> @@cc_candidates_at_cap;
+  SumAccum<INT>    @@merchants_over_cap;
+
+  x = SELECT c
+      FROM Card:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+      WHERE e.build_id == build_id
+      ACCUM c.@deg += 1,
+            m.@deg += 1,
+            @@interaction_edges += 1,
+            IF e.txn_count >= 2 THEN
+              c.@repeat_deg += 1, m.@repeat_deg += 1,
+              @@repeat_interaction_edges += 1
+            END;
+
+  cards = SELECT c FROM Card:c WHERE c.@deg > 0
+          POST-ACCUM
+            @@seen_cards += 1,
+            @@max_card_degree += c.@deg,
+            @@top_cards += DegreeEntry(c.card_number, c.@deg),
+            @@mm_candidates += (1.0 * c.@deg * (c.@deg - 1)) / 2.0;
+
+  merchants = SELECT m FROM Merchant:m WHERE m.@deg > 0
+              POST-ACCUM
+                @@seen_merchants += 1,
+                @@max_merchant_degree += m.@deg,
+                @@top_merchants += DegreeEntry(m.id, m.@deg),
+                @@merchant_degree_sq += 1.0 * m.@deg * m.@deg,
+                @@cc_candidates += (1.0 * m.@deg * (m.@deg - 1)) / 2.0,
+                IF probe_cap > 0 THEN
+                    IF m.@deg <= probe_cap THEN
+                        @@cc_candidates_at_cap +=
+                            (1.0 * m.@deg * (m.@deg - 1)) / 2.0
+                    ELSE
+                        @@merchants_over_cap += 1
+                    END
+                END;
+
+  DOUBLE card_pairs_possible     = (@@seen_cards * (@@seen_cards - 1)) / 2.0;
+  DOUBLE merchant_pairs_possible = (@@seen_merchants * (@@seen_merchants - 1)) / 2.0;
+  DOUBLE cc_saturation = 0;
+  DOUBLE mm_saturation = 0;
+  IF card_pairs_possible > 0 THEN
+      cc_saturation = @@cc_candidates / card_pairs_possible;
+  END;
+  IF merchant_pairs_possible > 0 THEN
+      mm_saturation = @@mm_candidates / merchant_pairs_possible;
+  END;
+
+  DOUBLE hub_concentration = 0;
+  DOUBLE max_reach_share   = 0;
+  IF @@seen_cards > 0 THEN
+      hub_concentration = @@merchant_degree_sq / (@@seen_cards * @@seen_cards);
+      max_reach_share   = (1.0 * @@max_merchant_degree) / @@seen_cards;
+  END;
+
+  PRINT @@seen_cards               AS cards_with_interactions,
+        @@seen_merchants           AS merchants_with_interactions,
+        @@interaction_edges        AS interaction_edges,
+        @@repeat_interaction_edges AS interaction_edges_txn_count_ge_2,
+        @@max_card_degree          AS max_card_degree,
+        @@max_merchant_degree      AS max_merchant_degree,
+        @@cc_candidates            AS card_card_candidate_pairs,
+        card_pairs_possible        AS card_pairs_possible,
+        cc_saturation              AS card_card_saturation_hint,
+        @@mm_candidates            AS merchant_merchant_candidate_pairs,
+        merchant_pairs_possible    AS merchant_pairs_possible,
+        mm_saturation              AS merchant_merchant_saturation_hint,
+        max_reach_share            AS max_merchant_reach_share,
+        hub_concentration          AS hub_concentration_S;
+
+  INT over_budget = 0;
+  IF probe_cap > 0 AND pair_budget > 0
+     AND @@cc_candidates_at_cap > pair_budget THEN
+      over_budget = 1;
+  END;
+
+  PRINT @@cc_candidates_at_cap AS card_card_candidate_pairs_at_cap,
+        @@merchants_over_cap   AS merchants_excluded_by_cap,
+        probe_cap              AS probe_cap_used,
+        pair_budget            AS pair_budget_used,
+        over_budget            AS ABORT_capped_candidate_pairs_over_budget;
+
+  PRINT @@top_merchants AS top_merchants_by_degree;
+  PRINT @@top_cards     AS top_cards_by_degree;
+}

@@ -1,0 +1,72 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY pagerank_merchant(
+    STRING build_id,
+    FLOAT  min_weight = 0,
+    FLOAT  max_change = 0.001,
+    INT    maximum_iteration = 25,
+    FLOAT  damping = 0.85,
+    BOOL   print_results = FALSE,
+    INT    top_k = 100
+) SYNTAX V1 {
+
+  TYPEDEF TUPLE<VERTEX Vertex_ID, FLOAT score> Vertex_Score;
+  HeapAccum<Vertex_Score>(top_k, score DESC) @@top_scores_heap;
+
+  MaxAccum<FLOAT> @@max_diff = 9999;
+  SumAccum<FLOAT> @sum_recvd_score = 0;
+  SumAccum<FLOAT> @sum_score = 1;
+  SumAccum<FLOAT> @sum_total_wt = 0;
+
+  SumAccum<INT>   @@scored, @@skipped_no_qualifying_edge, @@merchants_unseen;
+  SumAccum<INT>   @@iterations;
+
+  Seen = SELECT m FROM Merchant:m WHERE m.seen == TRUE;
+
+  wt = SELECT s FROM Seen:s -(Merchant_Merchant:e)- Merchant:t
+       WHERE t.seen == TRUE AND e.weight >= min_weight
+       ACCUM s.@sum_total_wt += e.weight;
+
+  Active = SELECT m FROM Seen:m WHERE m.@sum_total_wt > 0;
+
+  skip = SELECT m FROM Seen:m WHERE m.@sum_total_wt == 0
+         POST-ACCUM @@skipped_no_qualifying_edge += 1;
+
+  unseen = SELECT m FROM Merchant:m WHERE m.seen == FALSE
+           POST-ACCUM @@merchants_unseen += 1;
+
+  WHILE @@max_diff > max_change LIMIT maximum_iteration DO
+      @@max_diff = 0;
+      @@iterations += 1;
+      V = SELECT s
+          FROM Active:s -(Merchant_Merchant:e)- Merchant:t
+          WHERE t.seen == TRUE AND t.@sum_total_wt > 0
+            AND e.weight >= min_weight
+          ACCUM t.@sum_recvd_score += s.@sum_score * e.weight / s.@sum_total_wt
+          POST-ACCUM s.@sum_score = (1.0 - damping) + damping * s.@sum_recvd_score,
+                     s.@sum_recvd_score = 0,
+                     @@max_diff += abs(s.@sum_score - s.@sum_score')
+                                   / (1.0 + abs(s.@sum_score'));
+  END;
+
+  W = SELECT s FROM Active:s
+      POST-ACCUM
+        s.build_id = build_id,
+        s.pagerank = s.@sum_score,
+        @@scored += 1,
+        IF print_results THEN
+            @@top_scores_heap += Vertex_Score(s, s.@sum_score)
+        END;
+
+  PRINT @@scored                     AS merchants_scored,
+        @@skipped_no_qualifying_edge  AS merchants_seen_but_isolated_left_at_sentinel,
+        @@merchants_unseen            AS merchants_unseen_excluded,
+        @@iterations                  AS iterations_run,
+        maximum_iteration             AS iteration_limit,
+        @@max_diff                    AS final_max_change,
+        min_weight                    AS min_weight_used,
+        damping                       AS damping_used,
+        build_id                      AS build_id;
+
+  IF print_results THEN PRINT @@top_scores_heap; END;
+}

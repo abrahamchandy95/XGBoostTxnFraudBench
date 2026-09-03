@@ -1,0 +1,113 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY card_home_distance(
+    STRING build_id,
+    UINT   cutoff_event_seq,
+    INT    source_batch = 0,
+    INT    num_of_source_batches = 1
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  MaxAccum<UINT>   @home_seq;
+  MaxAccum<STRING> @home_zip;
+  SumAccum<INT>    @tenure_count;
+  MaxAccum<DOUBLE> @home_lat;
+  MaxAccum<DOUBLE> @home_lon;
+  OrAccum          @has_home;
+
+  SumAccum<INT> @@merchants_with_multiple_locations;
+  SumAccum<INT> @loc_count;
+  MaxAccum<STRING> @loc_key;
+  MaxAccum<DOUBLE> @loc_lat;
+  MaxAccum<DOUBLE> @loc_lon;
+  OrAccum          @has_loc;
+
+  SumAccum<INT>    @@cards_with_home;
+  SumAccum<INT>    @@cards_with_multiple_tenures;
+  SumAccum<INT>    @@merchants_with_location;
+  SumAccum<INT>    @@edges_written;
+  SumAccum<INT>    @@edges_missing_geography;
+  SumAccum<DOUBLE> @@distance_sum;
+  MaxAccum<DOUBLE> @@distance_max;
+
+  DOUBLE rad = 3.141592653589793 / 180.0;
+  DOUBLE earth_km = 6371.0088;
+
+  card_batch = SELECT c FROM Card:c
+               WHERE getvid(c) % num_of_source_batches == source_batch;
+
+  tenured = SELECT c
+      FROM card_batch:c -(Card_Belongs_To_Party>:e1)- Party:p
+                  -(Party_Has_Std_Postcode:e2)- Zipcode:z
+      WHERE z.has_coordinates == TRUE
+        AND e2.edge_event_seq < cutoff_event_seq
+      ACCUM c.@home_seq += e2.edge_event_seq, c.@tenure_count += 1;
+
+  keyed = SELECT c
+      FROM card_batch:c -(Card_Belongs_To_Party>:e1)- Party:p
+                  -(Party_Has_Std_Postcode:e2)- Zipcode:z
+      WHERE z.has_coordinates == TRUE
+      ACCUM
+        IF e2.edge_event_seq == c.@home_seq THEN
+            c.@home_zip += z.id
+        END;
+
+  homed = SELECT c
+      FROM card_batch:c -(Card_Belongs_To_Party>:e1)- Party:p
+                  -(Party_Has_Std_Postcode:e2)- Zipcode:z
+      WHERE z.has_coordinates == TRUE
+      ACCUM
+        IF e2.edge_event_seq == c.@home_seq AND z.id == c.@home_zip THEN
+            c.@home_lat += z.lat, c.@home_lon += z.lon, c.@has_home += TRUE
+        END
+      POST-ACCUM
+        IF c.@has_home THEN
+            @@cards_with_home += 1,
+            IF c.@tenure_count > 1 THEN
+                @@cards_with_multiple_tenures += 1
+            END
+        END;
+
+  located = SELECT m
+      FROM Merchant:m -(Merchant_Has_Location:e)- Merchant_Location:l
+      WHERE l.has_coordinates == TRUE
+      ACCUM m.@loc_key += l.location_id, m.@loc_count += 1
+      POST-ACCUM
+        @@merchants_with_location += 1,
+        CASE WHEN m.@loc_count > 1 THEN @@merchants_with_multiple_locations += 1 END;
+
+  sited = SELECT m
+      FROM Merchant:m -(Merchant_Has_Location:e)- Merchant_Location:l
+      WHERE l.has_coordinates == TRUE AND l.location_id == m.@loc_key
+      ACCUM m.@loc_lat += l.lat, m.@loc_lon += l.lon, m.@has_loc += TRUE;
+
+  written = SELECT c
+      FROM card_batch:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+      WHERE e.build_id == build_id
+      ACCUM
+        CASE WHEN c.@has_home AND m.@has_loc THEN
+            DOUBLE dlat = (m.@loc_lat - c.@home_lat) * rad,
+            DOUBLE dlon = (m.@loc_lon - c.@home_lon) * rad,
+            DOUBLE h = sin(dlat / 2) * sin(dlat / 2)
+                     + cos(c.@home_lat * rad) * cos(m.@loc_lat * rad)
+                       * sin(dlon / 2) * sin(dlon / 2),
+            DOUBLE km = 2 * earth_km * asin(sqrt(h)),
+            e.home_distance_km = km,
+            @@edges_written += 1,
+            @@distance_sum += km,
+            @@distance_max += km
+          ELSE
+            @@edges_missing_geography += 1
+        END;
+
+  PRINT @@merchants_with_multiple_locations AS merchants_with_multiple_locations_MUST_BE_ZERO,
+        @@edges_written                 AS edges_written,
+        @@edges_missing_geography       AS edges_missing_geography,
+        @@cards_with_home               AS cards_with_home_coordinates,
+        @@cards_with_multiple_tenures   AS cards_with_multiple_tenures,
+        @@merchants_with_location       AS merchants_with_location,
+        @@distance_max                  AS max_distance_km,
+        @@distance_sum                  AS distance_sum_km,
+        source_batch                    AS source_batch,
+        num_of_source_batches           AS source_batch_count,
+        build_id                        AS build_id;
+}

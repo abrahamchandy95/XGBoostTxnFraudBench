@@ -1,0 +1,64 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY derive_build_plan() FOR GRAPH TF_GNN {
+
+  MapAccum<INT, MinAccum<INT>> @@fold_cutoff;
+  MapAccum<INT, MaxAccum<INT>> @@fold_last;
+  MapAccum<INT, SumAccum<INT>> @@fold_rows;
+  MapAccum<INT, SumAccum<INT>> @@fold_frauds;
+
+  MapAccum<INT, MinAccum<INT>> @@split_cutoff;
+  MapAccum<INT, MaxAccum<INT>> @@split_last;
+  MapAccum<INT, SumAccum<INT>> @@split_rows;
+  MapAccum<INT, SumAccum<INT>> @@split_frauds;
+
+  SumAccum<INT> @@total_transactions, @@unknown_event_seq;
+  SumAccum<INT> @@unset_split_id, @@bad_label;
+
+  all = SELECT t FROM Payment_Transaction:t
+        POST-ACCUM
+          @@total_transactions += 1,
+
+          IF t.is_fraud != 0 AND t.is_fraud != 1 THEN
+              @@bad_label += 1
+          END,
+
+          IF t.event_seq == 0 THEN
+              @@unknown_event_seq += 1
+          ELSE
+              IF t.causal_fold >= 0 THEN
+                  @@fold_cutoff += (t.causal_fold -> t.event_seq),
+                  @@fold_last   += (t.causal_fold -> t.event_seq),
+                  @@fold_rows   += (t.causal_fold -> 1),
+                  IF t.is_fraud == 1 THEN
+                      @@fold_frauds += (t.causal_fold -> 1)
+                  END
+              END,
+
+              IF t.split_id < 0 THEN
+                  @@unset_split_id += 1
+              ELSE
+                  @@split_cutoff += (t.split_id -> t.event_seq),
+                  @@split_last   += (t.split_id -> t.event_seq),
+                  @@split_rows   += (t.split_id -> 1),
+                  IF t.is_fraud == 1 THEN
+                      @@split_frauds += (t.split_id -> 1)
+                  END
+              END
+          END;
+
+  PRINT @@total_transactions AS total_transactions,
+        @@unknown_event_seq  AS unknown_event_seq_MUST_BE_ZERO,
+        @@unset_split_id     AS unset_split_id_MUST_BE_ZERO,
+        @@bad_label          AS is_fraud_outside_0_1_MUST_BE_ZERO;
+
+  PRINT @@fold_cutoff  AS fold_first_event_seq,
+        @@fold_last    AS fold_last_event_seq,
+        @@fold_rows    AS fold_rows,
+        @@fold_frauds  AS fold_frauds;
+
+  PRINT @@split_cutoff AS split_first_event_seq,
+        @@split_last   AS split_last_event_seq,
+        @@split_rows   AS split_rows,
+        @@split_frauds AS split_frauds;
+}

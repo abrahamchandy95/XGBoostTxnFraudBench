@@ -1,0 +1,83 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY assert_cardinality() FOR GRAPH TF_GNN {
+
+  SumAccum<INT>    @@txn_count;
+  MinAccum<INT>    @@min_event_seq;
+  MaxAccum<INT>    @@max_event_seq;
+  SumAccum<INT>    @@sum_event_seq;
+  SumAccum<INT>    @@zero_event_seq;
+
+  SumAccum<INT> @@bad_card, @@bad_merchant;
+  MapAccum<INT, SumAccum<INT>> @@card_degree_histogram;
+  MapAccum<INT, SumAccum<INT>> @@merchant_degree_histogram;
+
+  SumAccum<INT> @@bad_split_id, @@bad_causal_fold, @@bad_label;
+  MapAccum<INT, SumAccum<INT>> @@split_histogram, @@fold_histogram;
+  MapAccum<INT, SumAccum<INT>> @@label_histogram;
+
+  SumAccum<INT> @@missing_card_key, @@missing_merchant_key;
+
+  all = SELECT t FROM Payment_Transaction:t
+        POST-ACCUM
+          @@txn_count += 1,
+
+          IF t.event_seq == 0 THEN
+              @@zero_event_seq += 1
+          ELSE
+              @@min_event_seq += t.event_seq,
+              @@max_event_seq += t.event_seq,
+              @@sum_event_seq += t.event_seq
+          END,
+
+          INT nc = t.outdegree("Transaction_From_Card"),
+          INT nm = t.outdegree("Transaction_To_Merchant"),
+          @@card_degree_histogram     += (nc -> 1),
+          @@merchant_degree_histogram += (nm -> 1),
+          IF nc != 1 THEN @@bad_card += 1 END,
+          IF nm != 1 THEN @@bad_merchant += 1 END,
+
+          IF t.card_number == "" THEN @@missing_card_key += 1 END,
+          IF t.merchant_id == "" THEN @@missing_merchant_key += 1 END,
+
+          @@label_histogram += (t.is_fraud -> 1),
+          IF t.is_fraud != 0 AND t.is_fraud != 1 THEN @@bad_label += 1 END,
+
+          @@split_histogram += (t.split_id -> 1),
+          @@fold_histogram  += (t.causal_fold -> 1),
+          IF t.split_id < 0 OR t.split_id > 2 THEN @@bad_split_id += 1 END,
+          IF (t.split_id > 0 AND t.causal_fold >= 0)
+             OR (t.split_id > 0 AND t.causal_fold == -2)
+             OR (t.split_id == 0 AND t.causal_fold == -1) THEN
+              @@bad_causal_fold += 1
+          END;
+
+  INT n = @@txn_count;
+  INT expected_sum = (n * (n + 1)) / 2;
+  INT sum_gap = @@sum_event_seq - expected_sum;
+
+  PRINT @@txn_count      AS transaction_count,
+        @@min_event_seq   AS min_event_seq_MUST_BE_1,
+        @@max_event_seq   AS max_event_seq_MUST_EQUAL_transaction_count,
+        @@sum_event_seq   AS sum_event_seq,
+        expected_sum      AS expected_sum_if_dense_and_unique,
+        sum_gap           AS sum_gap_MUST_BE_ZERO,
+        @@zero_event_seq  AS zero_event_seq_MUST_BE_ZERO;
+
+  PRINT @@bad_card     AS transactions_without_exactly_one_card_MUST_BE_ZERO,
+        @@bad_merchant AS transactions_without_exactly_one_merchant_MUST_BE_ZERO;
+
+  PRINT @@card_degree_histogram     AS card_edges_per_transaction,
+        @@merchant_degree_histogram AS merchant_edges_per_transaction;
+
+  PRINT @@missing_card_key     AS transactions_missing_card_number_MUST_BE_ZERO,
+        @@missing_merchant_key AS transactions_missing_merchant_id_MUST_BE_ZERO;
+
+  PRINT @@bad_label      AS is_fraud_outside_0_1_MUST_BE_ZERO,
+        @@label_histogram AS rows_per_label;
+
+  PRINT @@bad_split_id    AS split_id_out_of_range_MUST_BE_ZERO,
+        @@bad_causal_fold AS causal_fold_inconsistent_with_split_MUST_BE_ZERO,
+        @@split_histogram AS rows_per_split,
+        @@fold_histogram  AS rows_per_causal_fold;
+}

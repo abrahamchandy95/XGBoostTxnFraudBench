@@ -1,0 +1,469 @@
+CREATE GRAPH TF_GNN()
+
+USE GRAPH TF_GNN
+
+
+CREATE SCHEMA_CHANGE JOB tf_gnn_init FOR GRAPH TF_GNN {
+
+  ADD VERTEX Card(
+      PRIMARY_ID card_number STRING,
+
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT,
+
+      build_id STRING DEFAULT "",
+      seen BOOL DEFAULT "false",
+      pagerank FLOAT DEFAULT -1,
+      c_id INT DEFAULT -1,
+      c_size INT DEFAULT -1,
+      cc_degree INT DEFAULT -1,
+      louvain_id INT DEFAULT -1,
+      louvain_size INT DEFAULT -1,
+      core_number INT DEFAULT -1,
+      distinct_merchant_count INT DEFAULT -1,
+      repeated_merchant_count INT DEFAULT -1,
+      re_id INT DEFAULT -1,
+
+      txn_count INT DEFAULT -1,
+      total_amount DOUBLE DEFAULT -1,
+      max_txn_amount DOUBLE DEFAULT -1,
+      min_txn_amount DOUBLE DEFAULT -1,
+      avg_txn_amount DOUBLE DEFAULT -1,
+      max_amount_in_interval DOUBLE DEFAULT -1,
+      max_txn_count_in_interval INT DEFAULT -1,
+
+      fastrp LIST<DOUBLE>,
+      nbr_pagerank_mean DOUBLE DEFAULT -1,
+      nbr_pagerank_max DOUBLE DEFAULT -1,
+      nbr_c_size_mean DOUBLE DEFAULT -1,
+      nbr_c_size_max DOUBLE DEFAULT -1,
+      nbr_txn_count_mean DOUBLE DEFAULT -1,
+      nbr_txn_count_max DOUBLE DEFAULT -1
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+
+  ADD VERTEX Merchant(
+      PRIMARY_ID id STRING,
+
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT,
+
+      build_id STRING DEFAULT "",
+      seen BOOL DEFAULT "false",
+      pagerank FLOAT DEFAULT -1,
+      c_id INT DEFAULT -1,
+      c_size INT DEFAULT -1,
+      cc_degree INT DEFAULT -1,
+      louvain_id INT DEFAULT -1,
+      louvain_size INT DEFAULT -1,
+      core_number INT DEFAULT -1,
+      distinct_card_count INT DEFAULT -1,
+      repeated_card_count INT DEFAULT -1,
+      distinct_location_count INT DEFAULT -1,
+      re_id INT DEFAULT -1,
+
+      txn_count INT DEFAULT -1,
+      total_amount DOUBLE DEFAULT -1,
+      max_txn_amount DOUBLE DEFAULT -1,
+      min_txn_amount DOUBLE DEFAULT -1,
+      avg_txn_amount DOUBLE DEFAULT -1,
+
+      fastrp LIST<DOUBLE>,
+      nbr_pagerank_mean DOUBLE DEFAULT -1,
+      nbr_pagerank_max DOUBLE DEFAULT -1,
+      nbr_c_size_mean DOUBLE DEFAULT -1,
+      nbr_c_size_max DOUBLE DEFAULT -1,
+      nbr_txn_count_mean DOUBLE DEFAULT -1,
+      nbr_txn_count_max DOUBLE DEFAULT -1
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+
+  ADD VERTEX Payment_Transaction(
+      PRIMARY_ID id STRING,
+
+      card_number STRING DEFAULT "",
+      merchant_id STRING DEFAULT "",
+
+      transaction_time DATETIME,
+      unix_time UINT,
+      event_seq UINT,
+
+      split_id INT DEFAULT -1,
+      causal_fold INT DEFAULT -1,
+
+      amount DOUBLE,
+      is_fraud INT,
+
+      label_resolution_status STRING DEFAULT "unresolved",
+      label_available_unix_time UINT DEFAULT 0,
+
+      mer_cat STRING,
+      use_chip STRING,
+      error STRING,
+      is_online BOOL DEFAULT "false"
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+
+  ADD VERTEX Merchant_Category(
+      PRIMARY_ID category STRING,
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT,
+
+      build_id STRING DEFAULT "",
+      distinct_merchant_count INT DEFAULT -1,
+      txn_count INT DEFAULT -1,
+      total_amount DOUBLE DEFAULT -1,
+      max_txn_amount DOUBLE DEFAULT -1,
+      min_txn_amount DOUBLE DEFAULT -1,
+      avg_txn_amount DOUBLE DEFAULT -1
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+
+  ADD VERTEX Community(
+      PRIMARY_ID cid UINT,
+      entity_family STRING DEFAULT "",
+      member_count INT DEFAULT -1,
+      build_id STRING DEFAULT "",
+
+      txn_count INT DEFAULT -1,
+      total_amount DOUBLE DEFAULT -1,
+      max_amount DOUBLE DEFAULT -1,
+      min_amount DOUBLE DEFAULT -1,
+      avg_amount DOUBLE DEFAULT -1,
+      distinct_card_count INT DEFAULT -1,
+      distinct_merchant_count INT DEFAULT -1
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+
+  ADD DIRECTED EDGE Card_Send_Transaction(
+      FROM Card, TO Payment_Transaction,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  ) WITH REVERSE_EDGE="Transaction_From_Card";
+
+  ADD DIRECTED EDGE Transaction_To_Merchant(
+      FROM Payment_Transaction, TO Merchant,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  ) WITH REVERSE_EDGE="Merchant_Received_Transaction";
+
+
+  ADD DIRECTED EDGE Card_Merchant_Transaction(
+      FROM Card, TO Merchant,
+      DISCRIMINATOR(transaction_id STRING),
+      edge_unix_time UINT,
+      edge_event_seq UINT,
+      amount DOUBLE,
+      split_id INT DEFAULT -1,
+      is_online BOOL DEFAULT "false",
+      use_chip STRING DEFAULT "",
+      error STRING DEFAULT ""
+  ) WITH REVERSE_EDGE="Merchant_Transaction_From_Card";
+
+
+  ADD UNDIRECTED EDGE Has_Interaction_With_Merchant(
+      FROM Card, TO Merchant,
+      txn_count INT DEFAULT 0,
+      total_amount DOUBLE DEFAULT 0,
+      first_unix_time UINT DEFAULT 0,
+      first_event_seq UINT DEFAULT 0,
+      last_unix_time UINT DEFAULT 0,
+      last_event_seq UINT DEFAULT 0,
+      home_distance_km DOUBLE DEFAULT -1,
+      build_id STRING DEFAULT ""
+  );
+
+  ADD UNDIRECTED EDGE Card_Card(
+      FROM Card, TO Card,
+      weight INT
+  );
+
+  ADD UNDIRECTED EDGE Merchant_Merchant(
+      FROM Merchant, TO Merchant,
+      weight INT
+  );
+
+  ADD UNDIRECTED EDGE Has_Community(
+      FROM Card, TO Community
+      | FROM Merchant,
+      TO Community
+  );
+
+
+  ADD VERTEX Merchant_Location(
+      PRIMARY_ID location_id STRING,
+      is_online BOOL DEFAULT "false",
+      city STRING DEFAULT "",
+      state STRING DEFAULT "",
+      zipcode STRING DEFAULT "",
+      lat DOUBLE DEFAULT 0,
+      lon DOUBLE DEFAULT 0,
+      has_coordinates BOOL DEFAULT "false",
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX City(
+      PRIMARY_ID id STRING,
+      city STRING,
+      population INT DEFAULT -1,
+      lat DOUBLE DEFAULT 0,
+      lon DOUBLE DEFAULT 0,
+      has_coordinates BOOL DEFAULT "false",
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX State(
+      PRIMARY_ID id STRING,
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Zipcode(
+      PRIMARY_ID id STRING,
+      lat DOUBLE DEFAULT 0,
+      lon DOUBLE DEFAULT 0,
+      has_coordinates BOOL DEFAULT "false",
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD UNDIRECTED EDGE Merchant_Assigned(
+      FROM Merchant, TO Merchant_Category
+  );
+
+  ADD UNDIRECTED EDGE Merchant_Has_Location(
+      FROM Merchant, TO Merchant_Location,
+      edge_unix_time UINT, 
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Location_In_City(
+      FROM Merchant_Location, TO City,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Location_In_Zip(
+      FROM Merchant_Location, TO Zipcode,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Zip_Assigned_To_City(
+      FROM Zipcode, TO City,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE City_Located_In_State(
+      FROM City, TO State,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD VERTEX Party(
+      PRIMARY_ID id STRING,
+      party_type STRING,
+      gender STRING,
+      name STRING,                 
+      created_at DATETIME,        
+      created_unix_time UINT,
+      first_seen_unix_time UINT,
+      first_seen_event_seq UINT,
+      re_id INT DEFAULT -1
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+
+  ADD VERTEX Resolved_Entity(
+      PRIMARY_ID reid UINT,
+      member_count INT DEFAULT -1,
+      distinct_pii_count INT DEFAULT -1,
+      max_pair_score DOUBLE DEFAULT -1,
+      connected_card_count INT DEFAULT -1,
+      connected_merchant_count INT DEFAULT -1,
+      build_id STRING DEFAULT ""
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Birthdate(
+    PRIMARY_ID dob STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Email_Address(
+    PRIMARY_ID email STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Email_Address_Hash(
+    PRIMARY_ID hash STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Full_Name(
+    PRIMARY_ID name STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Full_Name_Hash(
+    PRIMARY_ID hash STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Phone(
+    PRIMARY_ID phone_number STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Phone_Hash(
+    PRIMARY_ID hash STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Street_Address(
+    PRIMARY_ID address STRING,
+    lat DOUBLE DEFAULT 0,
+    lon DOUBLE DEFAULT 0,
+    has_coordinates BOOL DEFAULT "false",
+    first_seen_unix_time UINT, 
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Identity_Document(
+    PRIMARY_ID id STRING,
+    id_type STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX IP(
+    PRIMARY_ID id STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD VERTEX Device(
+    PRIMARY_ID id STRING,
+    first_seen_unix_time UINT,
+    first_seen_event_seq UINT
+  ) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+
+  ADD DIRECTED EDGE Party_Has_Card(
+    FROM Party, TO Card,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  ) WITH REVERSE_EDGE="Card_Belongs_To_Party";
+
+  ADD DIRECTED EDGE Party_Is_Merchant(
+    FROM Party, TO Merchant,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  ) WITH REVERSE_EDGE="Merchant_Owned_By_Party";
+
+  ADD UNDIRECTED EDGE Party_Has_Birthdate(
+    FROM Party, TO Birthdate,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Email_Address(
+    FROM Party, TO Email_Address,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Email_Address_Hash(
+      FROM Party, TO Email_Address_Hash,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Name(
+      FROM Party, TO Full_Name,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Name_Hash(
+    FROM Party, TO Full_Name_Hash,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Phone(
+    FROM Party, TO Phone,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Phone_Hash(
+      FROM Party, TO Phone_Hash,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Street_Address(
+    FROM Party, TO Street_Address,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Identity_Document(
+    FROM Party, TO Identity_Document,
+    edge_unix_time UINT,
+    edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_IP(
+      FROM Party, TO IP,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Device(
+      FROM Party, TO Device,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Std_City(
+      FROM Party, TO City,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Std_Postcode(
+      FROM Party, TO Zipcode,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Party_Has_Std_State(
+      FROM Party, TO State,
+      edge_unix_time UINT,
+      edge_event_seq UINT
+  );
+
+  ADD UNDIRECTED EDGE Same_As(
+      FROM Party, TO Party,
+      score FLOAT,
+      resolved_at_event_seq UINT DEFAULT 0,
+      resolved_at_unix_time UINT DEFAULT 0
+  );
+
+  ADD UNDIRECTED EDGE Party_Resolved_As(
+      FROM Party, TO Resolved_Entity
+  );
+
+
+}
+
+RUN SCHEMA_CHANGE JOB tf_gnn_init

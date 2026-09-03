@@ -1,0 +1,42 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY assert_edge_stamp() FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT> @@cst_edges, @@cst_mismatch, @@cst_zero;
+  SumAccum<INT> @@ttm_edges, @@ttm_mismatch, @@ttm_zero;
+  MaxAccum<INT> @@cst_max_abs_diff, @@ttm_max_abs_diff;
+
+  cst = SELECT c FROM Card:c -(Card_Send_Transaction>:e)- Payment_Transaction:t
+        ACCUM
+          @@cst_edges += 1,
+          IF e.edge_event_seq == 0 THEN @@cst_zero += 1 END,
+          IF e.edge_event_seq != t.event_seq THEN
+              @@cst_mismatch += 1,
+              CASE WHEN e.edge_event_seq > t.event_seq
+                   THEN @@cst_max_abs_diff += (e.edge_event_seq - t.event_seq)
+                   ELSE @@cst_max_abs_diff += (t.event_seq - e.edge_event_seq)
+              END
+          END;
+
+  ttm = SELECT t FROM Payment_Transaction:t -(Transaction_To_Merchant>:e)- Merchant:m
+        ACCUM
+          @@ttm_edges += 1,
+          IF e.edge_event_seq == 0 THEN @@ttm_zero += 1 END,
+          IF e.edge_event_seq != t.event_seq THEN
+              @@ttm_mismatch += 1,
+              CASE WHEN e.edge_event_seq > t.event_seq
+                   THEN @@ttm_max_abs_diff += (e.edge_event_seq - t.event_seq)
+                   ELSE @@ttm_max_abs_diff += (t.event_seq - e.edge_event_seq)
+              END
+          END;
+
+  PRINT @@cst_mismatch AS card_send_transaction_stamp_mismatch_MUST_BE_ZERO,
+        @@cst_zero     AS card_send_transaction_stamp_zero_MUST_BE_ZERO,
+        @@ttm_mismatch AS transaction_to_merchant_stamp_mismatch_MUST_BE_ZERO,
+        @@ttm_zero     AS transaction_to_merchant_stamp_zero_MUST_BE_ZERO;
+
+  PRINT @@cst_edges         AS card_send_transaction_edges,
+        @@ttm_edges         AS transaction_to_merchant_edges,
+        @@cst_max_abs_diff  AS card_send_transaction_max_abs_difference,
+        @@ttm_max_abs_diff  AS transaction_to_merchant_max_abs_difference;
+}

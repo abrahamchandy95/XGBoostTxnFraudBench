@@ -1,0 +1,139 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY fastrp_merchant(
+    STRING build_id,
+    INT    embedding_dimension = 32,
+    INT    min_weight = 0,
+    FLOAT  beta = -0.1,
+    FLOAT  iteration_weight_1 = 1.0,
+    FLOAT  iteration_weight_2 = 1.0,
+    FLOAT  iteration_weight_3 = 0.0,
+    INT    sampling_constant = 3,
+    INT    random_seed = 42
+) SYNTAX V1 {
+
+  SumAccum<INT>   @deg;
+  SumAccum<FLOAT> @L;
+
+  MapAccum<INT, SumAccum<FLOAT>> @prev;
+  MapAccum<INT, SumAccum<FLOAT>> @cur;
+  MapAccum<INT, SumAccum<FLOAT>> @final;
+
+  ListAccum<DOUBLE> @row;
+
+  ListAccum<FLOAT>  @@weights;
+  ListAccum<DOUBLE> @@empty;
+
+  SumAccum<INT>    @@n, @@written, @@skipped_isolated;
+  SumAccum<DOUBLE> @@nonzero_entries, @@total_entries;
+  MinAccum<INT>    @@min_vector_length;
+  MaxAccum<INT>    @@max_vector_length;
+
+  @@weights += iteration_weight_1;
+  @@weights += iteration_weight_2;
+  @@weights += iteration_weight_3;
+
+  FLOAT v1 = sqrt(sampling_constant);
+
+  Seen = SELECT m FROM Merchant:m WHERE m.seen == TRUE
+         POST-ACCUM @@n += 1;
+
+  dg = SELECT s FROM Seen:s -(Merchant_Merchant:e)- Merchant:t
+       WHERE t.seen == TRUE AND e.weight >= min_weight
+       ACCUM s.@deg += 1;
+
+  nz = SELECT s FROM Seen:s
+       POST-ACCUM
+         IF s.@deg > 0 THEN
+             s.@L = pow((1.0 * s.@deg) / @@n, beta)
+         END;
+
+  init = SELECT s FROM Seen:s
+      WHERE s.@deg > 0
+      POST-ACCUM
+        FOREACH d IN RANGE[0, embedding_dimension-1] DO
+            INT r = (getvid(s) + 1) * 2654435761 % 2147483647,
+            r = (r + (d + 1) * 40503 + random_seed) % 2147483647,
+            r = (r * 1103515245 + 12345) % 2147483647,
+            INT bucket = r % (2 * sampling_constant),
+            IF bucket == 0 THEN
+                s.@prev += (d -> v1)
+            ELSE IF bucket == 1 THEN
+                s.@prev += (d -> (0 - v1))
+            END
+        END;
+
+  FOREACH it IN RANGE[0, 2] DO
+      FLOAT w = @@weights.get(it);
+      IF w != 0 THEN
+
+          prop = SELECT t FROM Seen:s -(Merchant_Merchant:e)- Merchant:t
+              WHERE t.seen == TRUE AND e.weight >= min_weight AND t.@deg > 0
+              ACCUM
+                FOREACH (d, val) IN s.@prev DO
+                    t.@cur += (d -> (val * s.@L) / t.@deg)
+                END
+              POST-ACCUM
+                FOREACH (d, val) IN t.@cur DO
+                    t.@final += (d -> w * val)
+                END;
+
+          roll = SELECT s FROM Seen:s
+              POST-ACCUM
+                s.@prev.clear(),
+                FOREACH (d, val) IN s.@cur DO
+                    s.@prev += (d -> val)
+                END,
+                s.@cur.clear();
+      END;
+  END;
+
+  wr = SELECT s FROM Seen:s
+      POST-ACCUM
+        IF s.@deg == 0 THEN
+            s.fastrp = @@empty,
+            @@skipped_isolated += 1
+        ELSE
+            FLOAT ss = 0,
+            FOREACH d IN RANGE[0, embedding_dimension-1] DO
+                IF s.@final.containsKey(d) THEN
+                    ss = ss + s.@final.get(d) * s.@final.get(d)
+                END
+            END,
+            FLOAT nrm = 1.0,
+            IF ss > 0 THEN nrm = sqrt(ss) END,
+            s.@row.clear(),
+            FOREACH d IN RANGE[0, embedding_dimension-1] DO
+                DOUBLE x = 0,
+                IF s.@final.containsKey(d) THEN
+                    x = s.@final.get(d) / nrm,
+                    @@nonzero_entries += 1
+                END,
+                @@total_entries += 1,
+                s.@row += x
+            END,
+            s.fastrp = s.@row,
+            @@min_vector_length += s.@row.size(),
+            @@max_vector_length += s.@row.size(),
+            s.build_id = build_id,
+            @@written += 1
+        END;
+
+  DOUBLE nonzero_fraction = 0;
+  IF @@total_entries > 0 THEN
+      nonzero_fraction = @@nonzero_entries / @@total_entries;
+  END;
+
+  PRINT @@min_vector_length AS min_vector_length_MUST_EQUAL_dimension,
+        @@max_vector_length AS max_vector_length_MUST_EQUAL_dimension;
+
+  PRINT @@written           AS merchants_embedded,
+        @@skipped_isolated  AS merchants_left_empty,
+        @@n                 AS merchants_seen,
+        nonzero_fraction    AS nonzero_fraction,
+        embedding_dimension AS embedding_dimension_used,
+        random_seed         AS random_seed_used,
+        min_weight          AS min_weight_used,
+        beta                AS beta_used,
+        build_id            AS build_id;
+}

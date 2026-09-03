@@ -1,0 +1,89 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY unify_parties(
+    STRING build_id,
+    UINT   cutoff_event_seq,
+    BOOL   print_results = FALSE,
+    INT    print_limit = 100
+) SYNTAX V1 {
+
+  MinAccum<INT>                @cc_id;
+  MapAccum<INT, SumAccum<INT>> @@comp_sizes, @@size_histogram;
+  MaxAccum<INT>                @@largest_component;
+  SumAccum<INT>                @@components, @@parties_resolved, @@parties_excluded;
+  SumAccum<INT>                @@same_as_total, @@same_as_unstamped, @@same_as_in_scope;
+  SumAccum<INT>                @@singletons;
+
+  audit = SELECT p
+          FROM Party:p -(Same_As:e)- Party:q
+          WHERE getvid(p) < getvid(q)
+          ACCUM
+            @@same_as_total += 1,
+            IF e.resolved_at_event_seq == 0 THEN
+                @@same_as_unstamped += 1
+            END,
+            IF e.resolved_at_event_seq > 0
+               AND e.resolved_at_event_seq < cutoff_event_seq THEN
+                @@same_as_in_scope += 1
+            END;
+
+  Scoped = SELECT p FROM Party:p
+           WHERE p.first_seen_event_seq > 0
+             AND p.first_seen_event_seq < cutoff_event_seq;
+
+  S = SELECT p FROM Scoped:p POST-ACCUM p.@cc_id = getvid(p);
+
+  WHILE (S.size() > 0) DO
+      S = SELECT t
+          FROM S:s -(Same_As:e)- Party:t
+          WHERE t.first_seen_event_seq > 0
+            AND t.first_seen_event_seq < cutoff_event_seq
+            AND e.resolved_at_event_seq > 0
+            AND e.resolved_at_event_seq < cutoff_event_seq
+          ACCUM t.@cc_id += s.@cc_id
+          HAVING t.@cc_id != t.@cc_id';
+  END;
+
+  sizes = SELECT p FROM Scoped:p
+          POST-ACCUM @@comp_sizes += (p.@cc_id -> 1);
+
+  write = SELECT p FROM Scoped:p
+          POST-ACCUM
+            INT sz = @@comp_sizes.get(p.@cc_id),
+            p.re_id = p.@cc_id,
+            @@largest_component += sz,
+            @@parties_resolved += 1,
+            IF sz == 1 THEN @@singletons += 1 END,
+            INSERT INTO Resolved_Entity (PRIMARY_ID, build_id)
+              VALUES (p.@cc_id, build_id),
+            INSERT INTO Party_Resolved_As VALUES (p, p.@cc_id);
+
+  excluded = SELECT p FROM Party:p
+             WHERE p.first_seen_event_seq == 0
+                OR p.first_seen_event_seq >= cutoff_event_seq
+             POST-ACCUM @@parties_excluded += 1;
+
+  FOREACH (cid, sz) IN @@comp_sizes DO
+      @@components += 1;
+      @@size_histogram += (sz -> 1);
+  END;
+
+  PRINT @@same_as_total     AS same_as_edges_total,
+        @@same_as_unstamped AS same_as_edges_unstamped_MUST_BE_ZERO,
+        @@same_as_in_scope  AS same_as_edges_under_cutoff;
+
+  PRINT @@parties_resolved   AS parties_resolved,
+        @@parties_excluded   AS parties_excluded_by_cutoff,
+        @@components         AS resolved_entity_count,
+        @@singletons         AS singleton_resolved_entities,
+        @@largest_component  AS largest_component_size,
+        cutoff_event_seq     AS cutoff_used,
+        build_id             AS build_id;
+
+  PRINT @@size_histogram AS resolved_entity_size_histogram;
+
+  IF print_results THEN
+      Top = SELECT p FROM Scoped:p LIMIT print_limit;
+      PRINT Top[Top.id, Top.re_id];
+  END;
+}

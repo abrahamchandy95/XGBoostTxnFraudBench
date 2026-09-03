@@ -1,0 +1,82 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY wcc_merchant(
+    STRING build_id,
+    FLOAT  min_weight = 0,
+    BOOL   print_results = FALSE,
+    INT    print_limit = 100
+) SYNTAX V1 {
+
+  MinAccum<INT>                @min_cc_id;
+  SumAccum<INT>                @cc_deg;
+  MapAccum<INT, SumAccum<INT>> @@comp_sizes;
+  MapAccum<INT, SumAccum<INT>> @@size_histogram;
+  MaxAccum<INT>                @@largest_component;
+  SumAccum<INT>                @@components, @@merchants_in_components;
+  SumAccum<INT>                @@merchants_isolated, @@merchants_unseen;
+
+  Seen = SELECT m FROM Merchant:m WHERE m.seen == TRUE;
+
+  dg = SELECT s FROM Seen:s -(Merchant_Merchant:e)- Merchant:t
+       WHERE t.seen == TRUE AND e.weight >= min_weight
+       ACCUM s.@cc_deg += 1;
+
+  Active = SELECT m FROM Seen:m WHERE m.@cc_deg > 0
+           POST-ACCUM
+             m.build_id = build_id,
+             m.cc_degree = m.@cc_deg,
+             m.@min_cc_id = getvid(m);
+
+  iso = SELECT m FROM Seen:m WHERE m.@cc_deg == 0
+        POST-ACCUM
+          m.build_id = build_id,
+          m.cc_degree = 0,
+          @@merchants_isolated += 1;
+
+  S = Active;
+  WHILE (S.size() > 0) DO
+      S = SELECT t
+          FROM S:s -(Merchant_Merchant:e)- Merchant:t
+          WHERE t.seen == TRUE AND t.@cc_deg > 0
+            AND e.weight >= min_weight
+          ACCUM t.@min_cc_id += s.@min_cc_id
+          HAVING t.@min_cc_id != t.@min_cc_id';
+  END;
+
+  sizes = SELECT m FROM Active:m
+          POST-ACCUM @@comp_sizes += (m.@min_cc_id -> 1);
+
+  write = SELECT m FROM Active:m
+          POST-ACCUM
+            INT sz = @@comp_sizes.get(m.@min_cc_id),
+            m.c_id = m.@min_cc_id,
+            m.c_size = sz,
+            @@largest_component += sz,
+            @@merchants_in_components += 1,
+            INSERT INTO Community (PRIMARY_ID, build_id)
+              VALUES (m.@min_cc_id, build_id),
+            INSERT INTO Has_Community VALUES (m, m.@min_cc_id);
+
+  unseen = SELECT m FROM Merchant:m WHERE m.seen == FALSE
+           POST-ACCUM @@merchants_unseen += 1;
+
+  FOREACH (cid, sz) IN @@comp_sizes DO
+      @@components += 1;
+      @@size_histogram += (sz -> 1);
+  END;
+
+  PRINT @@components               AS component_count,
+        @@merchants_in_components  AS merchants_in_components,
+        @@merchants_isolated       AS merchants_isolated_in_projection,
+        @@merchants_unseen         AS merchants_unseen_excluded,
+        @@largest_component        AS largest_component_size,
+        min_weight                 AS min_weight_used,
+        build_id                   AS build_id;
+
+  PRINT @@size_histogram AS component_size_histogram_MUST_HAVE_NO_KEY_1;
+
+  IF print_results THEN
+      Top = SELECT m FROM Active:m LIMIT print_limit;
+      PRINT Top[Top.c_id, Top.c_size, Top.cc_degree];
+  END;
+}

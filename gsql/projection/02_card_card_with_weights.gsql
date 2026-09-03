@@ -1,0 +1,58 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY card_card_with_weights(
+    STRING build_id,
+    INT    min_edge_weight = 1,
+    INT    max_merchant_degree = 5000,
+    INT    min_interaction_txn_count = 1,
+    INT    source_batch = 0,
+    INT    num_of_source_batches = 1
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  MapAccum<VERTEX<Card>, SumAccum<INT>> @edge_weight;
+
+  SumAccum<INT> @@inserted;
+  SumAccum<INT> @@suppressed_below_min_weight;
+  SumAccum<INT> @@hub_merchants_skipped;
+
+  hubs = SELECT m FROM Merchant:m
+         WHERE m.seen == TRUE
+           AND m.outdegree("Has_Interaction_With_Merchant") > max_merchant_degree
+         POST-ACCUM @@hub_merchants_skipped += 1;
+
+  card_batch = SELECT c
+      FROM Card:c
+           -(Has_Interaction_With_Merchant:e1)- Merchant:m
+           -(Has_Interaction_With_Merchant:e2)- Card:cd
+      WHERE getvid(c) % num_of_source_batches == source_batch
+        AND getvid(c) < getvid(cd)
+        AND e1.build_id == build_id
+        AND e2.build_id == build_id
+        AND e1.txn_count >= min_interaction_txn_count
+        AND e2.txn_count >= min_interaction_txn_count
+        AND m.outdegree("Has_Interaction_With_Merchant") <= max_merchant_degree
+      ACCUM
+        c.@edge_weight += (cd -> 1);
+
+  ins = SELECT c FROM card_batch:c
+      POST-ACCUM
+        FOREACH (cd, w) IN c.@edge_weight DO
+          IF w >= min_edge_weight THEN
+            INSERT INTO Card_Card VALUES (c, cd, w),
+            @@inserted += 1
+          ELSE
+            @@suppressed_below_min_weight += 1
+          END
+        END,
+        c.@edge_weight.clear();
+
+  PRINT @@inserted                    AS card_card_edges_inserted,
+        @@suppressed_below_min_weight AS pairs_below_min_edge_weight,
+        @@hub_merchants_skipped       AS hub_merchants_skipped,
+        source_batch                  AS source_batch,
+        num_of_source_batches         AS source_batch_count,
+        min_edge_weight               AS min_edge_weight_used,
+        max_merchant_degree           AS max_merchant_degree_used,
+        min_interaction_txn_count     AS min_interaction_txn_count_used,
+        build_id                      AS build_id;
+}

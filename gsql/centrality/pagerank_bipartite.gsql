@@ -1,0 +1,117 @@
+// weighted pagerank over Has_Interaction_With_Merchant
+USE GRAPH TF_GNN
+CREATE OR REPLACE DISTRIBUTED QUERY pagerank_bipartite(
+    STRING build_id,
+    INT    min_txn_count = 1,
+    FLOAT  max_change = 0.001,
+    INT    maximum_iteration = 25,
+    FLOAT  damping = 0.85,
+    BOOL   print_results = FALSE,
+    INT    top_k = 100
+) SYNTAX V1 {
+
+  TYPEDEF TUPLE<VERTEX Vertex_ID, FLOAT score> Vertex_Score;
+  HeapAccum<Vertex_Score>(top_k, score DESC) @@top_card_scores;
+  HeapAccum<Vertex_Score>(top_k, score DESC) @@top_merchant_scores;
+
+  MaxAccum<FLOAT> @@max_diff = 9999;
+  SumAccum<FLOAT> @sum_recvd_score = 0;
+  SumAccum<FLOAT> @sum_score = 1;
+  SumAccum<FLOAT> @sum_total_wt = 0;
+
+  SumAccum<INT> @@cards_scored, @@merchants_scored;
+  SumAccum<INT> @@cards_isolated, @@merchants_isolated;
+  SumAccum<INT> @@cards_unseen, @@merchants_unseen;
+  SumAccum<INT> @@iterations;
+
+  SeenC = SELECT c FROM Card:c     WHERE c.seen == TRUE;
+  SeenM = SELECT m FROM Merchant:m WHERE m.seen == TRUE;
+
+  wt = SELECT s FROM SeenC:s -(Has_Interaction_With_Merchant:e)- Merchant:t
+       WHERE t.seen == TRUE
+         AND e.build_id == build_id
+         AND e.txn_count >= min_txn_count
+       ACCUM s.@sum_total_wt += e.txn_count,
+             t.@sum_total_wt += e.txn_count;
+
+  ActiveC = SELECT c FROM SeenC:c WHERE c.@sum_total_wt > 0;
+  ActiveM = SELECT m FROM SeenM:m WHERE m.@sum_total_wt > 0;
+
+  skc = SELECT c FROM SeenC:c WHERE c.@sum_total_wt == 0
+        POST-ACCUM @@cards_isolated += 1;
+  skm = SELECT m FROM SeenM:m WHERE m.@sum_total_wt == 0
+        POST-ACCUM @@merchants_isolated += 1;
+
+  unc = SELECT c FROM Card:c WHERE c.seen == FALSE
+        POST-ACCUM @@cards_unseen += 1;
+  unm = SELECT m FROM Merchant:m WHERE m.seen == FALSE
+        POST-ACCUM @@merchants_unseen += 1;
+
+
+  WHILE @@max_diff > max_change LIMIT maximum_iteration DO
+      @@max_diff = 0;
+      @@iterations += 1;
+
+      pc = SELECT s FROM ActiveC:s -(Has_Interaction_With_Merchant:e)- Merchant:t
+           WHERE t.seen == TRUE
+             AND e.build_id == build_id
+             AND e.txn_count >= min_txn_count
+           ACCUM t.@sum_recvd_score += s.@sum_score * e.txn_count / s.@sum_total_wt;
+
+      pm = SELECT s FROM ActiveM:s -(Has_Interaction_With_Merchant:e)- Card:t
+           WHERE t.seen == TRUE
+             AND e.build_id == build_id
+             AND e.txn_count >= min_txn_count
+           ACCUM t.@sum_recvd_score += s.@sum_score * e.txn_count / s.@sum_total_wt;
+
+      uc = SELECT s FROM ActiveC:s
+           POST-ACCUM
+             s.@sum_score = (1.0 - damping) + damping * s.@sum_recvd_score,
+             s.@sum_recvd_score = 0,
+             @@max_diff += abs(s.@sum_score - s.@sum_score')
+                           / (1.0 + abs(s.@sum_score'));
+
+      um = SELECT s FROM ActiveM:s
+           POST-ACCUM
+             s.@sum_score = (1.0 - damping) + damping * s.@sum_recvd_score,
+             s.@sum_recvd_score = 0,
+             @@max_diff += abs(s.@sum_score - s.@sum_score')
+                           / (1.0 + abs(s.@sum_score'));
+  END;
+
+  wc = SELECT s FROM ActiveC:s
+       POST-ACCUM
+         s.build_id = build_id,
+         s.pagerank = s.@sum_score,
+         @@cards_scored += 1,
+         IF print_results THEN
+             @@top_card_scores += Vertex_Score(s, s.@sum_score)
+         END;
+
+  wm = SELECT s FROM ActiveM:s
+       POST-ACCUM
+         s.build_id = build_id,
+         s.pagerank = s.@sum_score,
+         @@merchants_scored += 1,
+         IF print_results THEN
+             @@top_merchant_scores += Vertex_Score(s, s.@sum_score)
+         END;
+
+  PRINT @@cards_scored       AS cards_scored,
+        @@merchants_scored   AS merchants_scored,
+        @@cards_isolated     AS cards_seen_but_isolated_left_at_sentinel,
+        @@merchants_isolated AS merchants_seen_but_isolated_left_at_sentinel,
+        @@cards_unseen       AS cards_unseen_excluded,
+        @@merchants_unseen   AS merchants_unseen_excluded,
+        @@iterations         AS iterations_run,
+        maximum_iteration    AS iteration_limit,
+        @@max_diff           AS final_max_change,
+        min_txn_count        AS min_txn_count_used,
+        damping              AS damping_used,
+        build_id             AS build_id;
+
+  IF print_results THEN
+      PRINT @@top_card_scores;
+      PRINT @@top_merchant_scores;
+  END;
+}

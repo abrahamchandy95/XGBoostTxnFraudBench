@@ -1,0 +1,91 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY interaction_strength_histogram(
+    STRING build_id,
+    INT probe_a = 2,
+    INT probe_b = 3,
+    INT probe_c = 5,
+    INT probe_d = 10,
+    INT probe_e = 1
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT> @da, @db, @dc, @dd, @de;
+
+  MapAccum<INT, SumAccum<INT>> @@txn_bands;
+  SumAccum<DOUBLE> @@edges;
+  MaxAccum<INT>    @@max_txn_count;
+  MinAccum<INT>    @@min_txn_count;
+  AvgAccum         @@avg_txn_count;
+
+  MapAccum<INT, SumAccum<DOUBLE>> @@surviving;
+  MapAccum<INT, SumAccum<INT>>    @@cards_attached, @@merchants_attached;
+
+  SumAccum<INT> @@cards_seen, @@merchants_seen;
+
+  hx = SELECT s
+       FROM Card:s -(Has_Interaction_With_Merchant:e)- Merchant:t
+       WHERE e.build_id == build_id
+       ACCUM
+         INT w = e.txn_count,
+         @@edges += 1,
+         @@max_txn_count += w,
+         @@min_txn_count += w,
+         @@avg_txn_count += w,
+
+         INT band = 9,
+         IF w == 1 THEN band = 1
+         ELSE IF w == 2 THEN band = 2
+         ELSE IF w == 3 THEN band = 3
+         ELSE IF w <= 5 THEN band = 4
+         ELSE IF w <= 10 THEN band = 5
+         ELSE IF w <= 20 THEN band = 6
+         ELSE IF w <= 50 THEN band = 7
+         ELSE IF w <= 100 THEN band = 8
+         END,
+         @@txn_bands += (band -> 1),
+
+         IF w >= probe_a AND probe_a != probe_e THEN
+             @@surviving += (probe_a -> 1), s.@da += 1, t.@da += 1 END,
+         IF w >= probe_b AND probe_b != probe_e AND probe_b != probe_a THEN
+             @@surviving += (probe_b -> 1), s.@db += 1, t.@db += 1 END,
+         IF w >= probe_c AND probe_c != probe_e AND probe_c != probe_a
+                         AND probe_c != probe_b THEN
+             @@surviving += (probe_c -> 1), s.@dc += 1, t.@dc += 1 END,
+         IF w >= probe_d AND probe_d != probe_e AND probe_d != probe_a
+                         AND probe_d != probe_b AND probe_d != probe_c THEN
+             @@surviving += (probe_d -> 1), s.@dd += 1, t.@dd += 1 END,
+         IF w >= probe_e THEN
+             @@surviving += (probe_e -> 1), s.@de += 1, t.@de += 1 END;
+
+  card_degrees = SELECT c FROM Card:c WHERE c.seen == TRUE
+      POST-ACCUM
+        @@cards_seen += 1,
+        IF c.@da > 0 THEN @@cards_attached += (probe_a -> 1) END,
+        IF c.@db > 0 THEN @@cards_attached += (probe_b -> 1) END,
+        IF c.@dc > 0 THEN @@cards_attached += (probe_c -> 1) END,
+        IF c.@dd > 0 THEN @@cards_attached += (probe_d -> 1) END,
+        IF c.@de > 0 THEN @@cards_attached += (probe_e -> 1) END;
+
+  merchant_degrees = SELECT m FROM Merchant:m WHERE m.seen == TRUE
+      POST-ACCUM
+        @@merchants_seen += 1,
+        IF m.@da > 0 THEN @@merchants_attached += (probe_a -> 1) END,
+        IF m.@db > 0 THEN @@merchants_attached += (probe_b -> 1) END,
+        IF m.@dc > 0 THEN @@merchants_attached += (probe_c -> 1) END,
+        IF m.@dd > 0 THEN @@merchants_attached += (probe_d -> 1) END,
+        IF m.@de > 0 THEN @@merchants_attached += (probe_e -> 1) END;
+
+  PRINT @@edges          AS interaction_edges,
+        @@min_txn_count  AS interaction_min_txn_count,
+        @@max_txn_count  AS interaction_max_txn_count,
+        @@avg_txn_count  AS interaction_avg_txn_count,
+        @@cards_seen     AS cards_seen,
+        @@merchants_seen AS merchants_seen,
+        build_id         AS build_id;
+
+  PRINT @@txn_bands AS interaction_txn_count_bands;
+
+  PRINT @@surviving          AS surviving_edges_by_threshold,
+        @@cards_attached     AS cards_attached_by_threshold,
+        @@merchants_attached AS merchants_attached_by_threshold;
+}

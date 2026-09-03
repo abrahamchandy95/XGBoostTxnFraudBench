@@ -1,0 +1,68 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY merchant_category_stats(
+    STRING build_id,
+    UINT   cutoff_event_seq
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT>    @cnt;
+  SumAccum<DOUBLE> @sum;
+  MaxAccum<DOUBLE> @max;
+  MinAccum<DOUBLE> @min;
+  SumAccum<INT>    @merchants;
+  SumAccum<INT>    @cat_degree;      
+
+  SumAccum<INT> @@with_merchants, @@without_merchants;
+  SumAccum<INT> @@with_history, @@without_history;
+  SumAccum<INT> @@merchants_multi_category;
+  SumAccum<INT> @@member_merchants_with_history, @@member_merchants_at_sentinel;
+
+  members = SELECT k FROM Merchant_Category:k -(Merchant_Assigned:e)- Merchant:m
+            ACCUM
+              k.@merchants += 1,
+              m.@cat_degree += 1,
+              IF m.txn_count > 0 THEN
+                  k.@cnt += m.txn_count,
+                  k.@sum += m.total_amount,
+                  k.@max += m.max_txn_amount,
+                  k.@min += m.min_txn_amount,
+                  @@member_merchants_with_history += 1
+              ELSE
+                  @@member_merchants_at_sentinel += 1
+              END;
+
+  chk = SELECT m FROM Merchant:m WHERE m.@cat_degree > 1
+        POST-ACCUM @@merchants_multi_category += 1;
+
+  w = SELECT k FROM Merchant_Category:k
+      POST-ACCUM
+        k.build_id = build_id,
+
+        IF k.@merchants > 0 THEN
+            k.distinct_merchant_count = k.@merchants,
+            @@with_merchants += 1
+        ELSE
+            @@without_merchants += 1
+        END,
+
+        IF k.@cnt > 0 THEN
+            k.txn_count      = k.@cnt,
+            k.total_amount   = k.@sum,
+            k.max_txn_amount = k.@max,
+            k.min_txn_amount = k.@min,
+            k.avg_txn_amount = k.@sum / k.@cnt,
+            @@with_history += 1
+        ELSE
+            @@without_history += 1
+        END;
+
+  PRINT @@member_merchants_with_history AS member_merchants_with_history,
+        @@member_merchants_at_sentinel  AS member_merchants_at_sentinel,
+        @@merchants_multi_category AS merchants_with_multiple_categories,
+        @@with_merchants           AS categories_with_merchants,
+        @@without_merchants        AS categories_left_at_sentinel_no_merchant,
+        @@with_history             AS categories_with_history,
+        @@without_history          AS categories_left_at_sentinel_no_txns,
+        cutoff_event_seq           AS cutoff_used,
+        build_id                   AS build_id;
+}

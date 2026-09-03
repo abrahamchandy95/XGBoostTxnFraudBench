@@ -1,0 +1,133 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY reset_build(
+    INT source_batch = 0,
+    INT num_of_source_batches = 1
+) FOR GRAPH TF_GNN {
+
+  ListAccum<DOUBLE> @@empty_list;
+
+  SumAccum<INT> @@cc_deleted, @@mm_deleted, @@hi_deleted;
+  SumAccum<INT> @@community_deleted;
+  SumAccum<INT> @@cards_reset, @@merchants_reset, @@categories_reset;
+  SumAccum<INT> @@resolved_entities_still_present;
+
+  d1 = SELECT c FROM Card:c -(Card_Card:e)- Card:c2
+       WHERE getvid(c) % num_of_source_batches == source_batch
+         AND getvid(c) < getvid(c2)
+       ACCUM @@cc_deleted += 1, DELETE(e);
+
+  d2 = SELECT m FROM Merchant:m -(Merchant_Merchant:e)- Merchant:m2
+       WHERE getvid(m) % num_of_source_batches == source_batch
+         AND getvid(m) < getvid(m2)
+       ACCUM @@mm_deleted += 1, DELETE(e);
+
+  d3 = SELECT c FROM Card:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+       WHERE getvid(c) % num_of_source_batches == source_batch
+       ACCUM @@hi_deleted += 1, DELETE(e);
+
+  d4 = SELECT k FROM Community:k
+       WHERE getvid(k) % num_of_source_batches == source_batch
+       POST-ACCUM @@community_deleted += 1, DELETE(k);
+
+  r1 = SELECT c FROM Card:c
+       WHERE getvid(c) % num_of_source_batches == source_batch
+       POST-ACCUM
+         c.build_id = "",
+         c.seen = FALSE,
+
+         /* topology */
+         c.pagerank = -1,
+         c.c_id = -1,
+         c.c_size = -1,
+         c.cc_degree = -1,
+         c.louvain_id = -1,
+         c.louvain_size = -1,
+         c.core_number = -1,
+         c.distinct_merchant_count = -1,
+         c.repeated_merchant_count = -1,
+         c.re_id = -1,
+
+         /* non-graph aggregates */
+         c.txn_count = -1,
+         c.total_amount = -1,
+         c.max_txn_amount = -1,
+         c.min_txn_amount = -1,
+         c.avg_txn_amount = -1,
+         c.max_amount_in_interval = -1,
+         c.max_txn_count_in_interval = -1,
+
+         /* Stage 2 arm */
+         c.fastrp = @@empty_list,
+         c.nbr_pagerank_mean = -1,
+         c.nbr_pagerank_max = -1,
+         c.nbr_c_size_mean = -1,
+         c.nbr_c_size_max = -1,
+         c.nbr_txn_count_mean = -1,
+         c.nbr_txn_count_max = -1,
+
+         @@cards_reset += 1;
+
+  /* ---- Merchant: same, minus the two travel attributes ---- */
+  r2 = SELECT m FROM Merchant:m
+       WHERE getvid(m) % num_of_source_batches == source_batch
+       POST-ACCUM
+         m.build_id = "",
+         m.seen = FALSE,
+
+         m.pagerank = -1,
+         m.c_id = -1,
+         m.c_size = -1,
+         m.cc_degree = -1,
+         m.louvain_id = -1,
+         m.louvain_size = -1,
+         m.core_number = -1,
+         m.distinct_card_count = -1,
+         m.repeated_card_count = -1,
+         m.re_id = -1,
+
+         m.txn_count = -1,
+         m.total_amount = -1,
+         m.max_txn_amount = -1,
+         m.min_txn_amount = -1,
+         m.avg_txn_amount = -1,
+
+         m.fastrp = @@empty_list,
+         m.nbr_pagerank_mean = -1,
+         m.nbr_pagerank_max = -1,
+         m.nbr_c_size_mean = -1,
+         m.nbr_c_size_max = -1,
+         m.nbr_txn_count_mean = -1,
+         m.nbr_txn_count_max = -1,
+
+         @@merchants_reset += 1;
+
+  r3 = SELECT k FROM Merchant_Category:k
+       WHERE getvid(k) % num_of_source_batches == source_batch
+       POST-ACCUM
+         k.build_id = "",
+         k.distinct_merchant_count = -1,
+         k.txn_count = -1,
+         k.total_amount = -1,
+         k.max_txn_amount = -1,
+         k.min_txn_amount = -1,
+         k.avg_txn_amount = -1,
+         @@categories_reset += 1;
+
+  ri = SELECT r FROM Resolved_Entity:r
+       WHERE getvid(r) % num_of_source_batches == source_batch
+       POST-ACCUM @@resolved_entities_still_present += 1;
+
+  PRINT @@cc_deleted        AS card_card_edges_deleted,
+        @@mm_deleted        AS merchant_merchant_edges_deleted,
+        @@hi_deleted        AS interaction_edges_deleted,
+        @@community_deleted AS community_vertices_deleted,
+        @@cards_reset       AS cards_reset,
+        @@merchants_reset   AS merchants_reset,
+        @@categories_reset  AS merchant_categories_reset,
+        source_batch        AS source_batch,
+        num_of_source_batches AS source_batch_count;
+
+  PRINT @@resolved_entities_still_present
+          AS resolved_entities_still_present_run_reset_identity_to_clear;
+}

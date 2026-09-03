@@ -1,0 +1,23 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_category_features(STRING build_id) FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @@rows;
+
+  Cats = SELECT k FROM Merchant_Category:k
+         WHERE k.build_id == build_id
+         POST-ACCUM @@rows += 1;
+
+  PRINT Cats[
+      Cats.category,
+      Cats.build_id,
+      Cats.distinct_merchant_count,
+      Cats.txn_count,
+      Cats.total_amount,
+      Cats.max_txn_amount,
+      Cats.min_txn_amount,
+      Cats.avg_txn_amount
+  ] AS category_features;
+
+  PRINT @@rows AS rows_returned, build_id AS build_id;
+}

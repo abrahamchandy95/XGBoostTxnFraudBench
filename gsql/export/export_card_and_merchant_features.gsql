@@ -1,0 +1,87 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_card_features(STRING build_id) FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @@rows;
+
+  Cards = SELECT c FROM Card:c
+          WHERE c.build_id == build_id AND c.seen == TRUE
+          POST-ACCUM @@rows += 1;
+
+  PRINT Cards[
+      Cards.card_number,
+      Cards.build_id,
+
+      Cards.pagerank,
+      Cards.c_size,
+      Cards.cc_degree,
+      Cards.louvain_size,
+      Cards.core_number,
+
+      Cards.distinct_merchant_count,
+      Cards.repeated_merchant_count,
+
+      Cards.txn_count,
+      Cards.total_amount,
+      Cards.max_txn_amount,
+      Cards.min_txn_amount,
+      Cards.avg_txn_amount,
+      Cards.max_amount_in_interval,
+      Cards.max_txn_count_in_interval,
+
+      Cards.c_id,
+      Cards.louvain_id,
+      Cards.re_id
+  ] AS card_features;
+
+  PRINT @@rows AS rows_returned, build_id AS build_id;
+}
+
+
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY export_merchant_features(STRING build_id) FOR GRAPH TF_GNN {
+
+  SumAccum<INT> @@rows;
+
+  SumAccum<INT> @@multi_location_merchants;
+  SumAccum<INT> @loc_count;
+
+  located = SELECT m
+      FROM Merchant:m -(Merchant_Has_Location:e)- Merchant_Location:l
+      WHERE l.has_coordinates == TRUE
+      ACCUM m.@loc_count += 1
+      POST-ACCUM
+        CASE WHEN m.@loc_count > 1 THEN @@multi_location_merchants += 1 END;
+
+  Merchants = SELECT m FROM Merchant:m
+              WHERE m.build_id == build_id AND m.seen == TRUE
+              POST-ACCUM @@rows += 1;
+
+  PRINT Merchants[
+      Merchants.id,
+      Merchants.build_id,
+
+      Merchants.pagerank,
+      Merchants.c_size,
+      Merchants.cc_degree,
+      Merchants.louvain_size,
+      Merchants.core_number,
+
+      Merchants.distinct_card_count,
+      Merchants.repeated_card_count,
+
+      Merchants.txn_count,
+      Merchants.total_amount,
+      Merchants.max_txn_amount,
+      Merchants.min_txn_amount,
+      Merchants.avg_txn_amount,
+
+      Merchants.c_id,
+      Merchants.louvain_id,
+      Merchants.re_id
+  ] AS merchant_features;
+
+  PRINT @@rows AS rows_returned, build_id AS build_id,
+        @@multi_location_merchants AS merchants_with_multiple_locations_MUST_BE_ZERO;
+}

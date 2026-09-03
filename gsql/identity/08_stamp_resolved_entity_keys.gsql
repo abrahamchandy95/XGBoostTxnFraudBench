@@ -1,0 +1,79 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY stamp_resolved_entity_keys(
+    STRING build_id,
+    UINT   cutoff_event_seq,
+    BOOL   drop_conflicts = FALSE
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  MinAccum<INT> @re_id_min;
+  MaxAccum<INT> @re_id_max;
+  OrAccum       @touched;
+
+  SumAccum<INT> @@cards_stamped, @@cards_conflicting, @@cards_dropped;
+  SumAccum<INT> @@merchants_stamped, @@merchants_conflicting, @@merchants_dropped;
+
+  cd = SELECT c
+       FROM Party:p -(Party_Has_Card>:e)- Card:c
+       WHERE p.re_id != -1
+         AND p.first_seen_event_seq > 0
+         AND p.first_seen_event_seq < cutoff_event_seq
+         AND e.edge_event_seq > 0
+         AND e.edge_event_seq < cutoff_event_seq
+       ACCUM c.@re_id_min += p.re_id,
+             c.@re_id_max += p.re_id,
+             c.@touched += TRUE;
+
+  wc = SELECT c FROM Card:c WHERE c.@touched == TRUE
+       POST-ACCUM
+         IF c.@re_id_min != c.@re_id_max THEN
+             @@cards_conflicting += 1,
+             IF drop_conflicts THEN
+                 c.re_id = -1,
+                 @@cards_dropped += 1
+             ELSE
+                 c.re_id = c.@re_id_min,
+                 @@cards_stamped += 1
+             END
+         ELSE
+             c.re_id = c.@re_id_min,
+             @@cards_stamped += 1
+         END;
+
+  mc = SELECT m
+       FROM Party:p -(Party_Is_Merchant>:e)- Merchant:m
+       WHERE p.re_id != -1
+         AND p.first_seen_event_seq > 0
+         AND p.first_seen_event_seq < cutoff_event_seq
+         AND e.edge_event_seq > 0
+         AND e.edge_event_seq < cutoff_event_seq
+       ACCUM m.@re_id_min += p.re_id,
+             m.@re_id_max += p.re_id,
+             m.@touched += TRUE;
+
+  wm = SELECT m FROM Merchant:m WHERE m.@touched == TRUE
+       POST-ACCUM
+         IF m.@re_id_min != m.@re_id_max THEN
+             @@merchants_conflicting += 1,
+             IF drop_conflicts THEN
+                 m.re_id = -1,
+                 @@merchants_dropped += 1
+             ELSE
+                 m.re_id = m.@re_id_min,
+                 @@merchants_stamped += 1
+             END
+         ELSE
+             m.re_id = m.@re_id_min,
+             @@merchants_stamped += 1
+         END;
+
+  PRINT @@cards_stamped       AS cards_stamped,
+        @@cards_conflicting   AS cards_with_conflicting_re_id,
+        @@cards_dropped       AS cards_dropped_as_conflicting,
+        @@merchants_stamped   AS merchants_stamped,
+        @@merchants_conflicting AS merchants_with_conflicting_re_id,
+        @@merchants_dropped   AS merchants_dropped_as_conflicting,
+        drop_conflicts        AS drop_conflicts_used,
+        cutoff_event_seq      AS cutoff_used,
+        build_id              AS build_id;
+}

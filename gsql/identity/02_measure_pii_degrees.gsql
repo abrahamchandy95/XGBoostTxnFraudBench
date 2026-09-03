@@ -1,0 +1,108 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY measure_pii_degrees(
+    UINT cutoff_event_seq,
+    INT  candidate_low_limit = 100,
+    INT  candidate_high_limit = 25000
+) FOR GRAPH TF_GNN {
+
+  SumAccum<INT>    @cutoff_deg;
+  MaxAccum<STRING> @rel;
+
+  MapAccum<STRING, SumAccum<INT>>    @@vertex_count;
+  MapAccum<STRING, SumAccum<INT>>    @@degree_one;
+  MapAccum<STRING, MaxAccum<INT>>    @@max_full_degree;
+  MapAccum<STRING, MaxAccum<INT>>    @@max_cutoff_degree;
+  MapAccum<STRING, SumAccum<DOUBLE>> @@pairs_retained;
+  MapAccum<STRING, SumAccum<DOUBLE>> @@pairs_dropped_low;
+  MapAccum<STRING, SumAccum<INT>>    @@above_high_limit;
+  MapAccum<STRING, SumAccum<INT>>    @@cutoff_disagreements;
+
+  MapAccum<STRING, MapAccum<INT, SumAccum<INT>>> @@band_histogram;
+
+  SetAccum<STRING> @@edge_type_set;
+
+  @@edge_type_set = (
+    "Party_Has_Birthdate",
+    "Party_Has_Street_Address",
+    "Party_Has_Identity_Document",
+    "Party_Has_Email_Address_Hash",
+    "Party_Has_Name_Hash",
+    "Party_Has_Phone_Hash"
+  );
+
+  all_parties = {Party.*};
+
+  /* Visit every PII vertex reachable under the cutoff, count the Parties
+     that actually hold it below the cutoff, and remember which relation
+     it arrived on. A PII vertex has exactly one relation inside this
+     set, so MaxAccum<STRING> holds a single value. */
+  piis = SELECT v
+         FROM all_parties:p -(@@edge_type_set:e)- :v
+         WHERE e.edge_event_seq > 0
+           AND e.edge_event_seq < cutoff_event_seq
+           AND p.first_seen_event_seq > 0
+           AND p.first_seen_event_seq < cutoff_event_seq
+         ACCUM v.@cutoff_deg += 1,
+               v.@rel += e.type;
+
+  report = SELECT v FROM piis:v
+      POST-ACCUM
+        STRING r = v.@rel,
+        INT full = v.outdegree(@@edge_type_set),
+        INT cd = v.@cutoff_deg,
+
+        @@vertex_count += (r -> 1),
+        @@max_full_degree += (r -> full),
+        @@max_cutoff_degree += (r -> cd),
+
+        /* match_parties requires outdegree > 1, so degree-1 vertices can
+           never produce a match */
+        IF cd == 1 THEN @@degree_one += (r -> 1) END,
+
+        /* candidate-pair volume, on the cutoff degree because that is
+           what would actually be scored */
+        IF cd > 1 AND full < candidate_low_limit THEN
+            @@pairs_retained += (r -> (1.0 * cd * (cd - 1)) / 2.0)
+        END,
+        IF cd > 1 AND full >= candidate_low_limit THEN
+            @@pairs_dropped_low += (r -> (1.0 * cd * (cd - 1)) / 2.0)
+        END,
+        IF full >= candidate_high_limit THEN
+            @@above_high_limit += (r -> 1)
+        END,
+
+        /* the finding: excluded on full degree, would have qualified on
+           the degree that actually existed at this cutoff */
+        IF full >= candidate_low_limit AND cd < candidate_low_limit THEN
+            @@cutoff_disagreements += (r -> 1)
+        END,
+
+        INT band = 8,
+        IF cd == 1 THEN band = 1
+        ELSE IF cd == 2 THEN band = 2
+        ELSE IF cd <= 5 THEN band = 3
+        ELSE IF cd <= 10 THEN band = 4
+        ELSE IF cd <= 100 THEN band = 5
+        ELSE IF cd <= 1000 THEN band = 6
+        ELSE IF cd <= 25000 THEN band = 7
+        END,
+        @@band_histogram += (r -> (band -> 1));
+
+  PRINT cutoff_event_seq     AS cutoff_used,
+        candidate_low_limit  AS candidate_low_limit,
+        candidate_high_limit AS candidate_high_limit;
+
+  PRINT @@vertex_count      AS pii_vertices_per_relation,
+        @@degree_one        AS degree_one_per_relation,
+        @@max_cutoff_degree AS max_cutoff_degree_per_relation,
+        @@max_full_degree   AS max_full_degree_per_relation;
+
+  PRINT @@pairs_retained    AS pairs_retained_per_relation,
+        @@pairs_dropped_low AS pairs_dropped_by_low_limit_per_relation,
+        @@above_high_limit  AS vertices_above_high_limit_per_relation;
+
+  PRINT @@cutoff_disagreements AS full_vs_cutoff_disagreements_per_relation;
+
+  PRINT @@band_histogram AS cutoff_degree_bands_per_relation;
+}

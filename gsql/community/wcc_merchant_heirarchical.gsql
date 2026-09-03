@@ -1,0 +1,82 @@
+// Alternative to wcc_merchant
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY wcc_merchant_hierarchical(
+    STRING build_id,
+    FLOAT  level_high = 10,
+    FLOAT  level_low  = 1,
+    INT    n_levels   = 10,
+    BOOL   print_results = FALSE
+) SYNTAX V1 {
+
+  MinAccum<INT>                @min_cc_id;
+  OrAccum                      @in_play;
+  MapAccum<INT, SumAccum<INT>> @@comp_sizes, @@size_histogram;
+  MapAccum<INT, SumAccum<INT>> @@peeled_at_level;
+  MaxAccum<INT>                @@largest_component;
+  SumAccum<INT>                @@components, @@merchants_in_components, @@merchants_unseen;
+
+  FLOAT seg = (level_high - level_low) / n_levels;
+
+  Seen = SELECT m FROM Merchant:m WHERE m.seen == TRUE;
+  S = SELECT m FROM Seen:m POST-ACCUM m.@min_cc_id = getvid(m);
+
+  init_play = SELECT m FROM Seen:m POST-ACCUM m.@in_play = TRUE;
+  remaining = Seen;
+
+  FOREACH i IN RANGE[1, n_levels] DO
+      FLOAT level = level_high - (i - 1) * seg;
+
+      S = remaining;
+      WHILE (S.size() > 0) DO
+          S = SELECT t
+              FROM S:s -(Merchant_Merchant:e)- Merchant:t
+              WHERE t.@in_play == TRUE AND e.weight >= level
+              ACCUM t.@min_cc_id += s.@min_cc_id
+              HAVING t.@min_cc_id != t.@min_cc_id';
+      END;
+
+      settled = SELECT t
+                FROM remaining:s -(Merchant_Merchant:e)- Merchant:t
+                WHERE t.@in_play == TRUE AND e.weight >= level;
+      @@peeled_at_level += (i -> settled.size());
+      drop_play = SELECT t FROM settled:t POST-ACCUM t.@in_play = FALSE;
+      remaining = remaining MINUS settled;
+  END;
+
+  sizes = SELECT m FROM Seen:m POST-ACCUM @@comp_sizes += (m.@min_cc_id -> 1);
+
+  write = SELECT m FROM Seen:m
+          POST-ACCUM
+            INT sz = @@comp_sizes.get(m.@min_cc_id),
+            m.c_id = m.@min_cc_id,
+            m.c_size = sz,
+            @@largest_component += sz,
+            @@merchants_in_components += 1,
+            INSERT INTO Community (PRIMARY_ID) VALUES (m.@min_cc_id),
+            INSERT INTO Has_Community VALUES (m, m.@min_cc_id);
+
+  unseen = SELECT m FROM Merchant:m WHERE m.seen == FALSE
+           POST-ACCUM @@merchants_unseen += 1;
+
+  FOREACH (cid, sz) IN @@comp_sizes DO
+      @@components += 1;
+      @@size_histogram += (sz -> 1);
+  END;
+
+
+  PRINT @@components          AS component_count,
+        @@merchants_in_components AS merchants_in_components,
+        @@merchants_unseen        AS merchants_unseen_excluded,
+        @@largest_component   AS largest_component_size,
+        level_high AS level_high_used, level_low AS level_low_used,
+        n_levels AS n_levels_used,
+        build_id AS build_id;
+  PRINT @@peeled_at_level AS vertices_settled_per_level;
+  PRINT @@size_histogram  AS component_size_histogram;
+
+  IF print_results THEN
+      Top = SELECT m FROM Seen:m LIMIT 100;
+      PRINT Top[Top.c_id, Top.c_size];
+  END;
+}

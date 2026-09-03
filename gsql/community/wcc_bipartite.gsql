@@ -1,0 +1,129 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY wcc_bipartite(
+    STRING build_id,
+    INT    min_txn_count = 1,
+    BOOL   print_results = FALSE,
+    INT    print_limit = 100
+) SYNTAX V1 {
+
+  MinAccum<INT>                @min_cc_id;
+  SumAccum<INT>                @cc_deg;
+  MapAccum<INT, SumAccum<INT>> @@comp_sizes;
+  MapAccum<INT, SumAccum<INT>> @@size_histogram;
+  MaxAccum<INT>                @@largest_component;
+  SumAccum<INT>                @@components;
+  SumAccum<INT>                @@cards_in_components, @@merchants_in_components;
+  SumAccum<INT>                @@cards_isolated, @@merchants_isolated;
+  SumAccum<INT>                @@cards_unseen, @@merchants_unseen;
+
+  SeenC = SELECT c FROM Card:c     WHERE c.seen == TRUE;
+  SeenM = SELECT m FROM Merchant:m WHERE m.seen == TRUE;
+
+  dg = SELECT s FROM SeenC:s -(Has_Interaction_With_Merchant:e)- Merchant:t
+       WHERE t.seen == TRUE
+         AND e.build_id == build_id
+         AND e.txn_count >= min_txn_count
+       ACCUM s.@cc_deg += 1,
+             t.@cc_deg += 1;
+
+  ActiveC = SELECT c FROM SeenC:c WHERE c.@cc_deg > 0
+            POST-ACCUM
+              c.build_id = build_id,
+              c.cc_degree = c.@cc_deg,
+              c.@min_cc_id = getvid(c);
+
+  ActiveM = SELECT m FROM SeenM:m WHERE m.@cc_deg > 0
+            POST-ACCUM
+              m.build_id = build_id,
+              m.cc_degree = m.@cc_deg,
+              m.@min_cc_id = getvid(m);
+
+  isoc = SELECT c FROM SeenC:c WHERE c.@cc_deg == 0
+         POST-ACCUM
+           c.build_id = build_id,
+           c.cc_degree = 0,
+           @@cards_isolated += 1;
+
+  isom = SELECT m FROM SeenM:m WHERE m.@cc_deg == 0
+         POST-ACCUM
+           m.build_id = build_id,
+           m.cc_degree = 0,
+           @@merchants_isolated += 1;
+
+  S = ActiveC UNION ActiveM;
+  WHILE (S.size() > 0) DO
+      SM = SELECT t
+           FROM S:s -(Has_Interaction_With_Merchant:e)- Merchant:t
+           WHERE t.seen == TRUE AND t.@cc_deg > 0
+             AND e.build_id == build_id
+             AND e.txn_count >= min_txn_count
+           ACCUM t.@min_cc_id += s.@min_cc_id
+           HAVING t.@min_cc_id != t.@min_cc_id';
+
+      SC = SELECT t
+           FROM S:s -(Has_Interaction_With_Merchant:e)- Card:t
+           WHERE t.seen == TRUE AND t.@cc_deg > 0
+             AND e.build_id == build_id
+             AND e.txn_count >= min_txn_count
+           ACCUM t.@min_cc_id += s.@min_cc_id
+           HAVING t.@min_cc_id != t.@min_cc_id';
+
+      S = SM UNION SC;
+  END;
+
+  szc = SELECT c FROM ActiveC:c
+        POST-ACCUM @@comp_sizes += (c.@min_cc_id -> 1);
+  szm = SELECT m FROM ActiveM:m
+        POST-ACCUM @@comp_sizes += (m.@min_cc_id -> 1);
+
+  wrc = SELECT c FROM ActiveC:c
+        POST-ACCUM
+          INT sz = @@comp_sizes.get(c.@min_cc_id),
+          c.c_id = c.@min_cc_id,
+          c.c_size = sz,
+          @@largest_component += sz,
+          @@cards_in_components += 1,
+          INSERT INTO Community (PRIMARY_ID, build_id)
+            VALUES (c.@min_cc_id, build_id),
+          INSERT INTO Has_Community VALUES (c, c.@min_cc_id);
+
+  wrm = SELECT m FROM ActiveM:m
+        POST-ACCUM
+          INT sz = @@comp_sizes.get(m.@min_cc_id),
+          m.c_id = m.@min_cc_id,
+          m.c_size = sz,
+          @@largest_component += sz,
+          @@merchants_in_components += 1,
+          INSERT INTO Community (PRIMARY_ID, build_id)
+            VALUES (m.@min_cc_id, build_id),
+          INSERT INTO Has_Community VALUES (m, m.@min_cc_id);
+
+  unc = SELECT c FROM Card:c WHERE c.seen == FALSE
+        POST-ACCUM @@cards_unseen += 1;
+  unm = SELECT m FROM Merchant:m WHERE m.seen == FALSE
+        POST-ACCUM @@merchants_unseen += 1;
+
+  FOREACH (cid, sz) IN @@comp_sizes DO
+      @@components += 1;
+      @@size_histogram += (sz -> 1);
+  END;
+
+  PRINT @@components             AS component_count,
+        @@cards_in_components    AS cards_in_components,
+        @@merchants_in_components AS merchants_in_components,
+        @@cards_isolated         AS cards_isolated_at_threshold,
+        @@merchants_isolated     AS merchants_isolated_at_threshold,
+        @@cards_unseen           AS cards_unseen_excluded,
+        @@merchants_unseen       AS merchants_unseen_excluded,
+        @@largest_component      AS largest_component_size,
+        min_txn_count            AS min_txn_count_used,
+        build_id                 AS build_id;
+
+  PRINT @@size_histogram AS component_size_histogram_MUST_HAVE_NO_KEY_1;
+
+  IF print_results THEN
+      TopC = SELECT c FROM ActiveC:c LIMIT print_limit;
+      PRINT TopC[TopC.c_id, TopC.c_size, TopC.cc_degree];
+  END;
+}

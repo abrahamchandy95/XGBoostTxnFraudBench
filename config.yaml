@@ -1,0 +1,134 @@
+seed: 42
+
+stage1_pipeline:
+
+  builds:
+    - build_id: b_train
+      cutoff: val_boundary
+      serves_splits: [0]
+    - build_id: b_val
+      cutoff: val_boundary
+      serves_splits: [1]
+    - build_id: b_test
+      cutoff: test_boundary
+      serves_splits: [2]
+
+  merge_identical_cutoffs: true
+
+  train_folds: 5
+
+  reset_batches: 4
+
+  fold_source: auto
+
+  enforce_gates: true
+
+  export_dimensions: true
+
+  identity:
+    enabled: true
+    threshold: 1.0
+    pii_low_connections_limit: 100
+    pii_high_connections_limit: 25000
+
+    birthdate_weight: 0.5
+    street_address_weight: 0.2
+    email_weight: 0.5
+    name_weight: 0.2
+    phone_weight: 0.5
+    identity_document_weight: 0.6
+
+    num_of_source_batches: 10
+
+    max_member_count: 50
+    max_component_fraction: 0.05
+
+    drop_conflicts: false
+
+  topology:
+    interaction_batches: 41
+
+  graph_features:
+    source: bipartite
+
+  projection:
+    min_edge_weight: 1
+    max_merchant_degree: 5000
+    max_card_degree: 5000
+    min_interaction_txn_count: 1
+    num_of_source_batches: 24
+    density_top_k: 25
+    pair_budget: 500000000.0
+
+  structure:
+    min_txn_count: 2
+    min_weight: 10
+
+  pagerank:
+    max_change: 0.001
+    maximum_iteration: 60
+    damping: 0.85
+
+  optional:
+    louvain: false
+    louvain_max_iteration: 20
+    kcore: false
+    kcore_max_core: 50
+    card_interval_max: false
+    card_interval_minutes: 5
+    card_interval_heap_capacity: 5000
+    card_interval_batches: 20
+
+tigergraph_export:
+  output_dir: data/stage1/export
+  fact_page_rows: 200000
+  min_page_rows: 1000
+  timeout_s: 86400
+  size_limit_bytes: 500000000
+  overwrite: true
+
+assemble:
+  export_dir: data/stage1/export
+  matrix_dir: data/stage1/matrix
+  overwrite: true
+
+  entity_rank_bins: 32
+
+data:
+  matrix_dir: data/stage1/matrix
+  require_all_feature_columns: true
+
+split:
+  train_id: 0
+  val_id: 1
+  test_id: 2
+
+features:
+  amount: true
+  is_online: true
+  time_components: [month, day, hour, dayofweek]
+  onehot: [use_chip, error]
+  target_encode:
+    columns: [mer_cat, merchant_id]
+    smoothing: 20.0
+    n_folds: 10
+
+model:
+  name: xgboost
+  params:
+    n_estimators: 2000
+    max_depth: 8
+    learning_rate: 0.1
+    tree_method: hist
+    eval_metric: aucpr
+    early_stopping_rounds: 50
+    min_child_weight: 1.0
+    subsample: 1.0
+    colsample_bytree: 1.0
+    nthread: -1
+
+stage1:
+  output_dir: artifacts/stage1
+  evaluation:
+    bootstrap_resamples: 200
+    bootstrap_level: 0.95

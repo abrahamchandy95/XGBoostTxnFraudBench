@@ -1,0 +1,39 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY build_card_merchant_transaction_edges(
+    INT num_of_batches = 10,
+    INT only_batch     = -1
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT> @@edges_inserted;
+  SumAccum<INT> @@txns_scanned;
+  SumAccum<INT> @@unknown_event_seq;
+
+  FOREACH i IN RANGE[0, num_of_batches-1] DO
+
+    IF only_batch < 0 OR only_batch == i THEN
+
+      card_batch = SELECT c FROM Card:c
+                   WHERE getvid(c) % num_of_batches == i;
+
+      ins = SELECT c
+            FROM card_batch:c -(Card_Send_Transaction>:e1)- Payment_Transaction:t
+                         -(Transaction_To_Merchant>:e2)- Merchant:m
+            ACCUM
+              @@txns_scanned += 1,
+              CASE WHEN t.event_seq == 0 THEN @@unknown_event_seq += 1 END,
+              INSERT INTO Card_Merchant_Transaction
+                (FROM, TO, transaction_id, edge_unix_time, edge_event_seq,
+                 amount, split_id, is_online, use_chip, error)
+                VALUES (c, m, t.id, t.unix_time, t.event_seq,
+                        t.amount, t.split_id, t.is_online, t.use_chip, t.error),
+              @@edges_inserted += 1;
+    END;
+  END;
+
+  PRINT @@edges_inserted     AS edges_inserted,
+        @@txns_scanned       AS transactions_scanned,
+        @@unknown_event_seq  AS txns_with_unknown_event_seq_MUST_BE_ZERO,
+        num_of_batches       AS batches_used,
+        only_batch           AS only_batch;
+}

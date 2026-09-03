@@ -1,0 +1,43 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE DISTRIBUTED QUERY card_transaction_stats(
+    STRING build_id,
+    UINT   cutoff_event_seq
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT>    @cnt;
+  SumAccum<DOUBLE> @sum;
+  MaxAccum<DOUBLE> @max;
+  MinAccum<DOUBLE> @min;
+  SumAccum<INT>    @@with_history, @@without_history;
+  SumAccum<INT>    @@txns_counted;
+
+  agg = SELECT c
+        FROM Card:c -(Card_Send_Transaction>:e)- Payment_Transaction:t
+        WHERE e.edge_event_seq > 0 AND e.edge_event_seq < cutoff_event_seq
+        ACCUM c.@cnt += 1,
+              c.@sum += t.amount,
+              c.@max += t.amount,
+              c.@min += t.amount,
+              @@txns_counted += 1;
+
+  w = SELECT c FROM Card:c
+      POST-ACCUM
+        c.build_id = build_id,
+        IF c.@cnt > 0 THEN
+            c.txn_count      = c.@cnt,
+            c.total_amount   = c.@sum,
+            c.max_txn_amount = c.@max,
+            c.min_txn_amount = c.@min,
+            c.avg_txn_amount = c.@sum / c.@cnt,
+            @@with_history += 1
+        ELSE
+            @@without_history += 1
+        END;
+
+  PRINT @@txns_counted     AS transactions_under_cutoff,
+        @@with_history     AS cards_with_history,
+        @@without_history  AS cards_left_at_sentinel,
+        cutoff_event_seq   AS cutoff_used,
+        build_id           AS build_id;
+}

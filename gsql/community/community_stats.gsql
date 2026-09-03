@@ -1,0 +1,112 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY community_stats(
+    STRING build_id,
+    UINT   cutoff_event_seq
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT>    @members;
+  SumAccum<INT>    @active_cards;
+  SumAccum<INT>    @active_merchants;
+  SumAccum<INT>    @txn_cnt;
+  SumAccum<DOUBLE> @amt_sum;
+  MaxAccum<DOUBLE> @amt_max;
+  MinAccum<DOUBLE> @amt_min;
+  OrAccum          @from_card;
+  OrAccum          @from_merchant;
+
+  SumAccum<INT> @@card_communities, @@merchant_communities, @@bipartite_communities;
+  SumAccum<INT> @@empty_communities;
+  SumAccum<INT> @@cards_at_sentinel, @@merchants_at_sentinel;
+
+  mc = SELECT k FROM Community:k -(Has_Community:e)- Card:c
+       ACCUM
+         k.@members += 1,
+         k.@from_card += TRUE,
+         IF c.txn_count > 0 THEN
+             k.@active_cards += 1,
+             k.@txn_cnt += c.txn_count,
+             k.@amt_sum += c.total_amount,
+             k.@amt_max += c.max_txn_amount,
+             k.@amt_min += c.min_txn_amount
+         ELSE
+             @@cards_at_sentinel += 1
+         END;
+
+  mm = SELECT k FROM Community:k -(Has_Community:e)- Merchant:m
+       ACCUM
+         k.@members += 1,
+         k.@from_merchant += TRUE,
+         IF m.txn_count > 0 THEN
+             k.@active_merchants += 1
+         ELSE
+             @@merchants_at_sentinel += 1
+         END;
+
+  mo = SELECT k FROM Community:k -(Has_Community:e)- Merchant:m
+       ACCUM
+         IF k.@from_card == FALSE AND m.txn_count > 0 THEN
+             k.@txn_cnt += m.txn_count,
+             k.@amt_sum += m.total_amount,
+             k.@amt_max += m.max_txn_amount,
+             k.@amt_min += m.min_txn_amount
+         END;
+
+  w = SELECT k FROM Community:k
+      POST-ACCUM
+        k.build_id = build_id,
+        k.member_count = k.@members,
+
+        IF k.@from_card AND k.@from_merchant THEN
+            k.entity_family = "bipartite",
+            IF k.@active_cards > 0 THEN
+                k.distinct_card_count = k.@active_cards
+            END,
+            IF k.@active_merchants > 0 THEN
+                k.distinct_merchant_count = k.@active_merchants
+            END,
+            @@bipartite_communities += 1
+        ELSE IF k.@from_card THEN
+            k.entity_family = "card",
+            IF k.@active_cards > 0 THEN
+                k.distinct_card_count = k.@active_cards
+            END,
+            @@card_communities += 1
+        ELSE IF k.@from_merchant THEN
+            k.entity_family = "merchant",
+            IF k.@active_merchants > 0 THEN
+                k.distinct_merchant_count = k.@active_merchants
+            END,
+            @@merchant_communities += 1
+        END,
+
+        IF k.@txn_cnt > 0 THEN
+            k.txn_count = k.@txn_cnt,
+            k.total_amount = k.@amt_sum,
+            k.max_amount = k.@amt_max,
+            k.min_amount = k.@amt_min,
+            k.avg_amount = k.@amt_sum / k.@txn_cnt
+        ELSE
+            @@empty_communities += 1
+        END;
+
+  INT single_family = @@card_communities + @@merchant_communities;
+  INT mode_mixture = 0;
+  IF @@bipartite_communities > 0 AND single_family > 0 THEN
+      IF @@bipartite_communities < single_family THEN
+          mode_mixture = @@bipartite_communities;
+      ELSE
+          mode_mixture = single_family;
+      END;
+  END;
+
+  PRINT @@cards_at_sentinel     AS member_cards_at_sentinel_MUST_BE_ZERO,
+        @@merchants_at_sentinel AS member_merchants_at_sentinel_MUST_BE_ZERO,
+        @@card_communities      AS card_communities,
+        @@merchant_communities  AS merchant_communities,
+        @@bipartite_communities AS bipartite_communities,
+        mode_mixture            AS mode_mixture_communities_MUST_BE_ZERO,
+        @@empty_communities     AS communities_with_no_txns_under_cutoff,
+        cutoff_event_seq        AS cutoff_used,
+        build_id                AS build_id;
+}

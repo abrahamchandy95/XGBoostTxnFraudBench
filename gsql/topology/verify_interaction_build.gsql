@@ -1,0 +1,26 @@
+USE GRAPH TF_GNN
+
+CREATE OR REPLACE QUERY verify_interaction_build(
+    STRING build_id,
+    UINT   cutoff_event_seq
+) FOR GRAPH TF_GNN SYNTAX V2 {
+
+  SumAccum<INT> @@under_cutoff;
+  SumAccum<INT> @@edges;
+  SumAccum<INT> @@edge_txn_sum;
+
+  t1 = SELECT t FROM Payment_Transaction:t
+       WHERE t.event_seq > 0 AND t.event_seq < cutoff_event_seq
+       ACCUM @@under_cutoff += 1;
+
+  e1 = SELECT c FROM Card:c -(Has_Interaction_With_Merchant:e)- Merchant:m
+       WHERE e.build_id == build_id
+       ACCUM @@edges += 1, @@edge_txn_sum += e.txn_count;
+
+  PRINT @@under_cutoff  AS transactions_under_cutoff_MUST_BE_BELOW_TOTAL,
+        @@under_cutoff  AS transactions_under_cutoff,
+        @@edge_txn_sum  AS interaction_txn_sum_MUST_EQUAL_transactions_under_cutoff,
+        @@edges         AS interaction_edges_for_build,
+        cutoff_event_seq AS cutoff_used,
+        build_id        AS build_id;
+}
